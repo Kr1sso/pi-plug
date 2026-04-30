@@ -85,6 +85,9 @@ export async function callModelTextJson(
 		{ role: "user", content: [{ type: "text", text: userText }], timestamp: Date.now() },
 	];
 
+	// Lazy-load runtime dep — see callModelText for rationale (test-env loadability).
+	const { complete } = await import("@mariozechner/pi-ai");
+
 	let lastText = "";
 	let lastError = "";
 	for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
