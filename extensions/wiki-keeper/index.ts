@@ -8,7 +8,6 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 	type ExtensionCommandContext,
-	type SessionEntry,
 } from "@mariozechner/pi-coding-agent";
 
 import { loadSettings, resolveCollectionName, resolveWikiPaths, type WikiKeeperSettings } from "./lib/settings.js";
@@ -37,6 +36,54 @@ const OPS_JSON_SHAPE_REMINDER = `{
 }
 
 If there is nothing to record, output exactly: {"summary":"no changes","ops":[]}`;
+
+/**
+ * Build a budgeted user message: glue {label, content} sections together with `---`,
+ * but if the total exceeds maxChars, truncate the FIRST tail-truncatable section from
+ * the FRONT (keeping its tail) and prepend a marker. Sections marked truncatable=false
+ * are always included whole.
+ *
+ * Used for ingest (truncate transcript) and sync (truncate file blocks). Keeps the most
+ * recent / most relevant content while staying under the model's prompt cap.
+ */
+interface PromptSection {
+	label: string;
+	content: string;
+	truncatable?: boolean; // if true, may be tail-kept-truncated to fit budget
+}
+function buildBudgetedUserText(sections: PromptSection[], maxChars: number): { text: string; truncated: boolean; originalChars: number; finalChars: number } {
+	const sep = "\n\n---\n\n";
+	const render = (s: PromptSection) => `# ${s.label}\n\n${s.content}`;
+	const kept = sections.filter((s) => s.content && s.content.length > 0);
+	const originalChars = kept.map(render).join(sep).length;
+	if (originalChars <= maxChars) return { text: kept.map(render).join(sep), truncated: false, originalChars, finalChars: originalChars };
+
+	// Compute fixed cost of non-truncatable sections (rendered + separators).
+	const fixed = kept.filter((s) => !s.truncatable);
+	const fixedRendered = fixed.map(render).join(sep);
+	const fixedCost = fixedRendered.length + (fixed.length > 0 && kept.some((s) => s.truncatable) ? sep.length : 0);
+	const budgetForTruncatable = Math.max(2_000, maxChars - fixedCost);
+
+	const truncatable = kept.filter((s) => s.truncatable);
+	let remaining = budgetForTruncatable;
+	const rebuilt: PromptSection[] = [];
+	for (const s of truncatable) {
+		const headerCost = `# ${s.label}\n\n`.length + sep.length;
+		const slice = Math.max(0, remaining - headerCost);
+		if (slice <= 200) break;
+		if (s.content.length <= slice) {
+			rebuilt.push(s);
+			remaining -= s.content.length + headerCost;
+		} else {
+			const marker = `[… truncated front: kept last ${slice} of ${s.content.length} chars to fit prompt budget …]\n\n`;
+			rebuilt.push({ label: s.label, content: marker + s.content.slice(-(slice - marker.length)) });
+			remaining = 0;
+		}
+	}
+	const finalSections = [...fixed, ...rebuilt];
+	const text = finalSections.map(render).join(sep);
+	return { text, truncated: true, originalChars, finalChars: text.length };
+}
 import { peekProject, renderPeek } from "./lib/scaffold.js";
 import { acquireWikiLock, listSnapshots, restoreLatestSnapshot, snapshotWiki } from "./lib/lock.js";
 import { detectDrift, isGitRepo, listSourceTrackingPages, suggestSyncTargets, summarizeDrift, writeLastSync } from "./lib/sync.js";
@@ -342,11 +389,11 @@ export default function (pi: ExtensionAPI) {
 			// Phase A — snapshot
 			let transcript = args.preparedTranscript;
 			if (!transcript) {
-				const branch = ctx.sessionManager.getBranch();
-				const messages = branch
-					.filter((e): e is SessionEntry & { type: "message" } => e.type === "message")
-					.map((e) => e.message);
-				transcript = serializeConversation(convertToLlm(messages));
+				// Use buildSessionContext() — the SAME view the LLM sees (post-compaction, with summaries
+				// replacing old chunks). getBranch() returns ALL entries including pre-compaction history,
+				// which can blow the prompt to many MB even when the live UI fill is modest.
+				const sessionContext = ctx.sessionManager.buildSessionContext();
+				transcript = serializeConversation(convertToLlm(sessionContext.messages));
 			}
 			if (!transcript || transcript.trim().length < 200) {
 				return { ok: true, summary: "transcript too short — skipped", opsApplied: 0 };
@@ -388,14 +435,16 @@ export default function (pi: ExtensionAPI) {
 			} catch {}
 
 			updatePhase(ctx, "calling translation model");
-			const userText = [
-				`# wiki/schema.md\n\n${schema}`,
-				`# wiki/index.md\n\n${index}`,
-				relatedPages ? `# Pre-fetched related wiki pages (qmd top hits)\n\n${relatedPages}` : "",
-				`# Session transcript\n\n${transcript}`,
-			]
-				.filter(Boolean)
-				.join("\n\n---\n\n");
+			const built = buildBudgetedUserText([
+				{ label: "wiki/schema.md", content: schema },
+				{ label: "wiki/index.md", content: index },
+				{ label: "Pre-fetched related wiki pages (qmd top hits)", content: relatedPages },
+				{ label: "Session transcript", content: transcript, truncatable: true },
+			], state.settings.maxPromptChars);
+			if (built.truncated) {
+				notify(ctx, `Wiki flush: prompt ${built.originalChars} chars exceeded budget (${state.settings.maxPromptChars}); truncated transcript front to fit (${built.finalChars} chars).`, "warning");
+			}
+			const userText = built.text;
 
 			const llm = await callModelTextJson(ctx, resolved.model, PROMPT_INGEST, userText, ctx.signal, 8192, { jsonShapeReminder: OPS_JSON_SHAPE_REMINDER, debugDumpPath: join(paths.root, ".debug", "last-bad-flush.txt") });
 			if (!llm.ok) {
@@ -579,11 +628,15 @@ export default function (pi: ExtensionAPI) {
 			const relatedPages = [...hitMap.values()].slice(0, 8).join("\n\n---\n\n");
 
 			const schema = readFileIfExists(paths.schemaMd) ?? "";
-			const userText = [
-				`# wiki/schema.md\n\n${schema}`,
-				relatedPages ? `# Pre-existing related wiki pages\n\n${relatedPages}` : "",
-				`# Changed source files (current content)\n\n${fileBlocks.join("\n\n---\n\n")}`,
-			].filter(Boolean).join("\n\n---\n\n");
+			const built = buildBudgetedUserText([
+				{ label: "wiki/schema.md", content: schema },
+				{ label: "Pre-existing related wiki pages", content: relatedPages },
+				{ label: "Changed source files (current content)", content: fileBlocks.join("\n\n---\n\n"), truncatable: true },
+			], state.settings.maxPromptChars);
+			if (built.truncated) {
+				notify(ctx, `Wiki sync: prompt ${built.originalChars} chars exceeded budget (${state.settings.maxPromptChars}); truncated changed-files block front to fit (${built.finalChars} chars).`, "warning");
+			}
+			const userText = built.text;
 
 			updatePhase(ctx, "calling translation model");
 			const llm = await callModelTextJson(ctx, resolved.model, PROMPT_SYNC, userText, ctx.signal, 8192, { jsonShapeReminder: OPS_JSON_SHAPE_REMINDER, debugDumpPath: join(paths.root, ".debug", "last-bad-sync.txt") });

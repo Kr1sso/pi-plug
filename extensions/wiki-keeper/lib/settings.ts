@@ -31,6 +31,8 @@ export interface WikiKeeperSettings {
 	prefetchMinPages: number;
 	/** When log.md exceeds this many entries (lines starting `## [`), suggest /wiki:archive on session_start. */
 	logArchiveSuggestEntries: number;
+	/** Hard cap on the user-message size (in characters) sent to the translation model. Truncates the transcript tail-first to fit. ~3 chars/token, so 600k chars ≈ 200k tokens — safely under most providers' 1M-token cap with room for system prompt + response. */
+	maxPromptChars: number;
 }
 
 export const DEFAULT_SETTINGS: WikiKeeperSettings = {
@@ -48,6 +50,7 @@ export const DEFAULT_SETTINGS: WikiKeeperSettings = {
 	qmdAutoEmbedOnStart: true,
 	prefetchMinPages: 5,
 	logArchiveSuggestEntries: 500,
+	maxPromptChars: 600_000,
 };
 
 interface SettingsFile {
