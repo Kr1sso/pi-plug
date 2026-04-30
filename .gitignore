@@ -4,3 +4,6 @@ node_modules/
 .pi/git/
 .pi/npm/
 # Don't ignore .pi/settings.json (project config) or .pi/todos
+.pi/settings.json
+.pi/git/
+.pi/extensions/
