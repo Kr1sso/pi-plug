@@ -1053,10 +1053,12 @@ export default function (pi: ExtensionAPI) {
 			}
 			const result = await runWikiFix(ctx);
 			if (result.ok) {
+				const remaining = result.remainingDead + result.remainingOrphans;
+				const label = remaining > 0 ? "wiki partial fix" : "wiki fixed";
 				notify(
 					ctx,
-					`wiki fix: ${result.summary} [${result.opsApplied} ops; remaining: ${result.remainingDead} dead, ${result.remainingOrphans} orphans]`,
-					result.remainingDead + result.remainingOrphans > 0 ? "warning" : "info",
+					`${label}: ${result.summary} [${result.opsApplied} ops; remaining: ${result.remainingDead} dead, ${result.remainingOrphans} orphans]`,
+					remaining > 0 ? "warning" : "info",
 				);
 			} else {
 				notify(ctx, `wiki fix failed: ${result.error}`, "error");
