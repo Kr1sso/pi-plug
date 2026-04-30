@@ -1,0 +1,25 @@
+{
+  "name": "pi-plug",
+  "version": "0.1.0",
+  "description": "pi-plug: wiki-keeper extension + wiki skill. Persistent project knowledge base maintained by pi, kept fresh by triggering at 50% context fill, indexed with qmd.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Kr1sso/pi-plug.git"
+  },
+  "scripts": {
+    "postinstall": "bash ./install.sh || true",
+    "check": "echo 'no checks configured'"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/wiki-keeper/index.ts"
+    ],
+    "skills": [
+      "./skills/wiki"
+    ]
+  },
+  "dependencies": {}
+}

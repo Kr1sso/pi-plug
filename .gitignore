@@ -1,0 +1,6 @@
+node_modules/
+*.log
+.DS_Store
+.pi/git/
+.pi/npm/
+# Don't ignore .pi/settings.json (project config) or .pi/todos
