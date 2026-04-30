@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, appendFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, appendFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import type { WikiPaths } from "./settings.js";
 
@@ -38,6 +38,7 @@ export type WikiOp =
 	| { op: "overwrite"; path: string; content: string }
 	| { op: "append"; path: string; content: string }
 	| { op: "replace_section"; path: string; heading: string; content: string }
+	| { op: "delete"; path: string }
 	| { op: "log"; entry: string };
 
 export interface ApplyReport {
@@ -89,6 +90,13 @@ export function applyOps(paths: WikiPaths, ops: WikiOp[]): ApplyReport {
 				const existing = existsSync(abs) ? readFileSync(abs, "utf8") : "";
 				const next = replaceSection(existing, op.heading, op.content);
 				writeFileSync(abs, next);
+				report.updated.push(abs);
+			} else if (op.op === "delete") {
+				if (!existsSync(abs)) {
+					report.skipped.push({ path: op.path, reason: "already absent" });
+					continue;
+				}
+				rmSync(abs, { force: true });
 				report.updated.push(abs);
 			}
 		} catch (err) {

@@ -53,6 +53,7 @@ Your context is then replaced with a thin "wiki rotated — query first" pointer
 | `/wiki:undo` | Restore the wiki from the most recent pre-cycle snapshot. |
 | `/wiki:query <q>` | Manual qmd query against the wiki. |
 | `/wiki:lint` | Run dead-link / orphan / contradiction check. |
+| `/wiki:fix` | LLM-driven repair of lint issues (dead links, orphans, source-missing pages). Lock-protected, snapshot-backed. |
 | `/wiki:status` | Show context fill, qmd state, settings. |
 | `/wiki:model <provider> <id>` | Set translation model (default: current model). |
 

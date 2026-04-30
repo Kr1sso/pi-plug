@@ -26,7 +26,7 @@ import { qmdAvailable, qmdEmbed, qmdEnsureCollection, qmdQuery, qmdStatus } from
 import { callModelText, extractJson, resolveTranslationModel } from "./lib/translate.js";
 import { peekProject, renderPeek } from "./lib/scaffold.js";
 import { acquireWikiLock, listSnapshots, restoreLatestSnapshot, snapshotWiki } from "./lib/lock.js";
-import { detectDrift, isGitRepo, suggestSyncTargets, summarizeDrift, writeLastSync } from "./lib/sync.js";
+import { detectDrift, isGitRepo, listSourceTrackingPages, suggestSyncTargets, summarizeDrift, writeLastSync } from "./lib/sync.js";
 import { gitBlobShaOfFile, parseDoc, serializeDoc, fileMtime } from "./lib/frontmatter.js";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
@@ -38,6 +38,7 @@ const PROMPT_SCAFFOLD = readFileSync(join(__dirname, "prompts", "scaffold.md"), 
 const PROMPT_SEED = readFileSync(join(__dirname, "prompts", "seed.md"), "utf8");
 const PROMPT_KEYPHRASES = readFileSync(join(__dirname, "prompts", "keyphrases.md"), "utf8");
 const PROMPT_SYNC = readFileSync(join(__dirname, "prompts", "sync.md"), "utf8");
+const PROMPT_FIX = readFileSync(join(__dirname, "prompts", "fix.md"), "utf8");
 
 const WIKI_GITIGNORE = `# pi-plug wiki transient state
 .lock
@@ -393,8 +394,12 @@ export default function (pi: ExtensionAPI) {
 				const lint = lintWiki(paths);
 				lintText = formatLintReport(lint, paths.root);
 				applyOps(paths, [{ op: "overwrite", path: "lint-report.md", content: lintText }]);
-				if (lint.deadLinks.length) {
-					notify(ctx, `Wiki lint: ${lint.deadLinks.length} dead link(s). See wiki/lint-report.md.`, "warning");
+				if (lint.deadLinks.length || lint.orphans.length) {
+					notify(
+						ctx,
+						`Wiki lint: ${lint.deadLinks.length} dead link(s), ${lint.orphans.length} orphan(s). Run /wiki:fix to repair.`,
+						"warning",
+					);
 				}
 			}
 
@@ -576,6 +581,139 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	/** LLM-driven repair pass for lint issues. */
+	const runWikiFix = async (
+		ctx: ExtensionContext,
+	): Promise<{
+		ok: boolean;
+		summary: string;
+		opsApplied: number;
+		remainingDead: number;
+		remainingOrphans: number;
+		error?: string;
+	}> => {
+		if (state.cycleInProgress) {
+			return { ok: false, summary: "", opsApplied: 0, remainingDead: 0, remainingOrphans: 0, error: "cycle already running" };
+		}
+		state.cycleInProgress = true;
+		const sessionId = sessionIdOf(ctx);
+		startIndicator(ctx, "fix", "acquiring lock");
+		const { paths } = await scaffoldWiki(ctx);
+		if (!activeIndicator) startIndicator(ctx, "fix", "acquiring lock");
+		const lock = await acquireWikiLock(join(paths.root, ".lock"), sessionId, { timeoutMs: LOCK_TIMEOUT_MS });
+		if (!lock) {
+			state.cycleInProgress = false;
+			stopIndicator(ctx);
+			return { ok: false, summary: "", opsApplied: 0, remainingDead: 0, remainingOrphans: 0, error: "another session holds the wiki lock; try again shortly" };
+		}
+		try {
+			updatePhase(ctx, "linting");
+			const lintBefore = lintWiki(paths);
+			const issueCount = lintBefore.deadLinks.length + lintBefore.orphans.length;
+			const sourceMissingPages = listSourceTrackingPages(paths, process.cwd())
+				.filter((r) => {
+					try {
+						const fm = parseDoc(readFileSync(r.wikiFile, "utf8")).frontmatter;
+						return fm["source-status"] === "missing";
+					} catch {
+						return false;
+					}
+				});
+			if (issueCount === 0 && sourceMissingPages.length === 0) {
+				return { ok: true, summary: "no issues to fix", opsApplied: 0, remainingDead: 0, remainingOrphans: 0 };
+			}
+
+			updatePhase(ctx, "gathering implicated pages");
+			// Collect every page implicated in an issue, plus a list of all wiki paths.
+			const allPages = listMarkdownFiles(paths.root);
+			const implicated = new Set<string>();
+			for (const d of lintBefore.deadLinks) implicated.add(d.file);
+			for (const o of lintBefore.orphans) implicated.add(o);
+			for (const c of lintBefore.contradictions) implicated.add(c.file);
+			for (const m of sourceMissingPages) implicated.add(m.wikiFile);
+			// Cap at ~25 pages of context to keep the prompt bounded.
+			const implicatedList = [...implicated].slice(0, 25);
+			const pageBlocks: string[] = [];
+			for (const f of implicatedList) {
+				const content = readFileIfExists(f);
+				if (content) pageBlocks.push(`### ${relative(paths.root, f)}\n\n${content.slice(0, 4000)}`);
+			}
+
+			const lintReport = formatLintReport(lintBefore, paths.root);
+			const pathList = allPages.map((p) => relative(paths.root, p)).sort().join("\n");
+			const schema = readFileIfExists(paths.schemaMd) ?? "";
+			const userText = [
+				`# wiki/schema.md\n\n${schema}`,
+				`# Lint report\n\n${lintReport}`,
+				sourceMissingPages.length
+					? `# Source-missing pages\n\n${sourceMissingPages.map((m) => `- ${relative(paths.root, m.wikiFile)} → ${relative(process.cwd(), m.sourceFile)}`).join("\n")}`
+					: "",
+				`# All wiki paths (for picking valid link targets)\n\n\`\`\`\n${pathList}\n\`\`\``,
+				`# Implicated pages (full content)\n\n${pageBlocks.join("\n\n---\n\n")}`,
+			]
+				.filter(Boolean)
+				.join("\n\n---\n\n");
+
+			updatePhase(ctx, "calling repair model");
+			const resolved = resolveTranslationModel(ctx, state.settings);
+			if (!resolved.model) {
+				return { ok: false, summary: "", opsApplied: 0, remainingDead: lintBefore.deadLinks.length, remainingOrphans: lintBefore.orphans.length, error: resolved.error };
+			}
+			const llm = await callModelText(ctx, resolved.model, PROMPT_FIX, userText, ctx.signal, 8192);
+			if (!llm.ok) {
+				return { ok: false, summary: "", opsApplied: 0, remainingDead: lintBefore.deadLinks.length, remainingOrphans: lintBefore.orphans.length, error: `repair translate failed: ${llm.error}` };
+			}
+			const parsed = extractJson(llm.text) as { summary?: string; ops?: WikiOp[] } | undefined;
+			if (!parsed) {
+				return { ok: false, summary: "", opsApplied: 0, remainingDead: lintBefore.deadLinks.length, remainingOrphans: lintBefore.orphans.length, error: "repair produced unparseable JSON" };
+			}
+			const ops: WikiOp[] = Array.isArray(parsed.ops) ? parsed.ops : [];
+
+			// Tag log entries with session id.
+			const hasLog = ops.some((o) => o.op === "log");
+			if (!hasLog) {
+				ops.push({
+					op: "log",
+					entry: `## [${nowStamp()}] fix | ${sessionId} | ${(parsed.summary ?? `repaired lint issues`).replace(/\n/g, " ").slice(0, 200)}`,
+				});
+			} else {
+				for (const op of ops) {
+					if (op.op === "log" && !op.entry.includes(sessionId)) {
+						op.entry = op.entry.replace(/^(##\s+\[[^\]]+\]\s+\S+\s+\|\s+)/, `$1${sessionId} | `);
+					}
+				}
+			}
+
+			updatePhase(ctx, `applying ${ops.length} ops`);
+			snapshotWiki(paths.root);
+			applyOps(paths, ops);
+
+			updatePhase(ctx, "re-linting");
+			const lintAfter = lintWiki(paths);
+			applyOps(paths, [{ op: "overwrite", path: "lint-report.md", content: formatLintReport(lintAfter, paths.root) }]);
+
+			updatePhase(ctx, "restamping + reindexing");
+			restampAllSourceTrackedPages(paths);
+			writeLastSync(paths, process.cwd());
+			try {
+				await qmdEmbed(state.settings.qmdCollection, process.cwd());
+			} catch {}
+
+			return {
+				ok: true,
+				summary: parsed.summary ?? "repair complete",
+				opsApplied: ops.length,
+				remainingDead: lintAfter.deadLinks.length,
+				remainingOrphans: lintAfter.orphans.length,
+			};
+		} finally {
+			lock.release();
+			state.cycleInProgress = false;
+			stopIndicator(ctx);
+		}
+	};
+
+	/** Walk all source-tracked pages, restamp source-sha + source-mtime + last-synced. */
 	const restampAllSourceTrackedPages = (paths: ReturnType<typeof resolveWikiPaths>) => {
 		for (const wikiFile of listMarkdownFiles(paths.root)) {
 			let text: string;
@@ -784,11 +922,33 @@ export default function (pi: ExtensionAPI) {
 			const lint = lintWiki(paths);
 			const text = formatLintReport(lint, paths.root);
 			applyOps(paths, [{ op: "overwrite", path: "lint-report.md", content: text }]);
+			const hasIssues = lint.deadLinks.length + lint.orphans.length > 0;
 			notify(
 				ctx,
-				`lint: ${lint.deadLinks.length} dead, ${lint.orphans.length} orphans, ${lint.contradictions.length} contradictions.`,
-				lint.deadLinks.length ? "warning" : "info",
+				`lint: ${lint.deadLinks.length} dead, ${lint.orphans.length} orphans, ${lint.contradictions.length} contradictions.${hasIssues ? " Run /wiki:fix to repair." : ""}`,
+				hasIssues ? "warning" : "info",
 			);
+		},
+	});
+
+	pi.registerCommand("wiki:fix", {
+		description: "LLM-driven repair of lint issues (dead links, orphans, source-missing). Lock-protected, snapshot-backed.",
+		handler: async (_args, ctx) => {
+			refreshSettings();
+			if (state.cycleInProgress) {
+				notify(ctx, "wiki: cycle already running; try again in a moment.", "warning");
+				return;
+			}
+			const result = await runWikiFix(ctx);
+			if (result.ok) {
+				notify(
+					ctx,
+					`wiki fix: ${result.summary} [${result.opsApplied} ops; remaining: ${result.remainingDead} dead, ${result.remainingOrphans} orphans]`,
+					result.remainingDead + result.remainingOrphans > 0 ? "warning" : "info",
+				);
+			} else {
+				notify(ctx, `wiki fix failed: ${result.error}`, "error");
+			}
 		},
 	});
 
