@@ -951,9 +951,20 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("turn_end", (_event, ctx) => {
+	pi.on("turn_end", (event, ctx) => {
 		refreshSettings(); // hot-reload settings each turn check
 		if (state.cycleInProgress) return;
+
+		// CRITICAL: turn_end fires after EVERY tool roundtrip, not just when the agent is
+		// truly done (per pi-agent-core/agent-loop.js — `await emit({ type: "turn_end" })`
+		// runs inside `while (hasMoreToolCalls)`). Calling ctx.compact() mid-loop aborts the
+		// in-flight agent (compact() does _disconnectFromAgent + await abort()), leaving the
+		// user's task half-finished. Only trigger when this turn's assistant message has NO
+		// outstanding tool calls — i.e., the agent is about to exit the loop naturally.
+		const hasOutstandingToolCalls = Array.isArray(event.message?.content)
+			&& event.message.content.some((c: { type?: string }) => c?.type === "toolCall");
+		if (hasOutstandingToolCalls) return;
+
 		const ratio = computeFillRatio(ctx);
 		if (ratio === null) return;
 		// Hysteresis: re-arm when we drop back under threshold.
