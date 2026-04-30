@@ -1,3 +1,4 @@
+import { basename } from "node:path";
 import { readFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,12 +24,19 @@ import {
 import { qmdAvailable, qmdEmbed, qmdEnsureCollection, qmdQuery, qmdStatus } from "./lib/qmd.js";
 import { callModelText, extractJson, resolveTranslationModel } from "./lib/translate.js";
 import { peekProject, renderPeek } from "./lib/scaffold.js";
+import { acquireWikiLock, listSnapshots, restoreLatestSnapshot, snapshotWiki } from "./lib/lock.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const PROMPT_INGEST = readFileSync(join(__dirname, "prompts", "ingest.md"), "utf8");
 const PROMPT_SCAFFOLD = readFileSync(join(__dirname, "prompts", "scaffold.md"), "utf8");
 const PROMPT_SEED = readFileSync(join(__dirname, "prompts", "seed.md"), "utf8");
+const PROMPT_KEYPHRASES = readFileSync(join(__dirname, "prompts", "keyphrases.md"), "utf8");
+
+/** Cap the synthesized post-rotation summary so it doesn't bleed tokens into the next session. */
+const MAX_ROTATION_SUMMARY_CHARS = 600;
+/** Hard cap on lock wait — single session shouldn't block another for more than this. */
+const LOCK_TIMEOUT_MS = 45_000;
 
 const STATUS_KEY = "wiki-keeper";
 
@@ -37,7 +45,7 @@ interface SessionState {
 	cycleInProgress: boolean;
 	lastCycleAt: number;
 	armed: boolean; // hysteresis: only fire once per crossing of the threshold
-	pendingRotateMarker: boolean; // set when an auto-trigger compaction is in flight
+	disciplineNudgeApplied: boolean; // ensure we only inject systemPrompt addendum once per session
 }
 
 export default function (pi: ExtensionAPI) {
@@ -46,7 +54,15 @@ export default function (pi: ExtensionAPI) {
 		cycleInProgress: false,
 		lastCycleAt: 0,
 		armed: true,
-		pendingRotateMarker: false,
+		disciplineNudgeApplied: false,
+	};
+
+	const sessionIdOf = (ctx: ExtensionContext) => {
+		try {
+			return basename(ctx.sessionManager.getSessionFile() || "").replace(/\.json$/, "") || `pid-${process.pid}`;
+		} catch {
+			return `pid-${process.pid}`;
+		}
 	};
 
 	// ─── helpers ──────────────────────────────────────────────────────
@@ -177,9 +193,23 @@ export default function (pi: ExtensionAPI) {
 		const { ctx, reason } = args;
 		if (state.cycleInProgress) return { ok: false, summary: "", opsApplied: 0, error: "cycle already running" };
 		state.cycleInProgress = true;
+		const sessionId = sessionIdOf(ctx);
+		setStatus(ctx, "wiki: acquiring lock");
+		const { paths } = await scaffoldWiki(ctx);
+		const lock = await acquireWikiLock(join(paths.root, ".lock"), sessionId, { timeoutMs: LOCK_TIMEOUT_MS });
+		if (!lock) {
+			state.cycleInProgress = false;
+			setStatus(ctx, undefined);
+			return {
+				ok: false,
+				summary: "",
+				opsApplied: 0,
+				error: `another session holds the wiki lock for >${Math.round(LOCK_TIMEOUT_MS / 1000)}s; skipping cycle (will retry on next trigger)`,
+			};
+		}
 		setStatus(ctx, "wiki: snapshot");
 		try {
-			const { paths } = await scaffoldWiki(ctx);
+			snapshotWiki(paths.root); // pre-cycle snapshot for /wiki:undo
 
 			// Phase A — snapshot
 			let transcript = args.preparedTranscript;
@@ -204,22 +234,29 @@ export default function (pi: ExtensionAPI) {
 			const schema = readFileIfExists(paths.schemaMd) ?? "";
 			const index = readFileIfExists(paths.indexMd) ?? "";
 
-			// Pre-fetch related pages via qmd to ground the translation.
+			// Pre-fetch related pages via qmd, grounded by LLM-extracted keyphrases (better hits than raw tail).
 			let relatedPages = "";
 			try {
-				const probe = transcript.slice(-2000);
-				const hits = await qmdQuery(probe, state.settings.qmdCollection, 6);
-				if (hits.length) {
-					const blocks: string[] = [];
+				const keyphrases = await extractKeyphrases(ctx, resolved.model, transcript);
+				const hitMap = new Map<string, { path: string; score: number; snippet?: string }>();
+				for (const phrase of keyphrases) {
+					const hits = await qmdQuery(phrase, state.settings.qmdCollection, 4);
 					for (const h of hits) {
 						const p = (h.path as string) || "";
 						if (!p) continue;
-						const abs = p.startsWith("/") ? p : join(paths.root, p);
-						const content = readFileIfExists(abs);
-						if (content) blocks.push(`### ${relative(paths.root, abs)}\n\n${content.slice(0, 4000)}`);
+						const score = typeof h.score === "number" ? h.score : 0;
+						const prev = hitMap.get(p);
+						if (!prev || prev.score < score) hitMap.set(p, { path: p, score, snippet: h.snippet as string | undefined });
 					}
-					relatedPages = blocks.join("\n\n---\n\n");
 				}
+				const top = [...hitMap.values()].sort((a, b) => b.score - a.score).slice(0, 6);
+				const blocks: string[] = [];
+				for (const h of top) {
+					const abs = h.path.startsWith("/") ? h.path : join(paths.root, h.path);
+					const content = readFileIfExists(abs);
+					if (content) blocks.push(`### ${relative(paths.root, abs)}\n\n${content.slice(0, 4000)}`);
+				}
+				relatedPages = blocks.join("\n\n---\n\n");
 			} catch {}
 
 			const userText = [
@@ -238,13 +275,21 @@ export default function (pi: ExtensionAPI) {
 			if (!parsed) return { ok: false, summary: "", opsApplied: 0, error: "translation produced unparseable JSON" };
 			const ops: WikiOp[] = Array.isArray(parsed.ops) ? parsed.ops : [];
 
-			// Always make sure there's at least one log entry.
+			// Always make sure there's at least one log entry, tagged with this session id
+			// so concurrent multi-session activity is traceable.
 			const hasLog = ops.some((o) => o.op === "log");
 			if (!hasLog) {
 				ops.push({
 					op: "log",
-					entry: `## [${nowStamp()}] ${reason} | ${(parsed.summary ?? "wiki update").replace(/\n/g, " ").slice(0, 200)}`,
+					entry: `## [${nowStamp()}] ${reason} | ${sessionId} | ${(parsed.summary ?? "wiki update").replace(/\n/g, " ").slice(0, 200)}`,
 				});
+			} else {
+				// Tag any log ops the model produced that are missing the session id.
+				for (const op of ops) {
+					if (op.op === "log" && !op.entry.includes(sessionId)) {
+						op.entry = op.entry.replace(/^(##\s+\[[^\]]+\]\s+\S+\s+\|\s+)/, `$1${sessionId} | `);
+					}
+				}
 			}
 
 			// Phase C — apply
@@ -283,9 +328,23 @@ export default function (pi: ExtensionAPI) {
 				lintReport: lintText,
 			};
 		} finally {
+			lock.release();
 			state.cycleInProgress = false;
 			setStatus(ctx, undefined);
 		}
+	};
+
+	const extractKeyphrases = async (
+		ctx: ExtensionContext,
+		model: NonNullable<ExtensionContext["model"]>,
+		transcript: string,
+	): Promise<string[]> => {
+		const tail = transcript.slice(-6000);
+		const result = await callModelText(ctx, model, "", PROMPT_KEYPHRASES + tail, ctx.signal, 400);
+		if (!result.ok) return [];
+		const parsed = extractJson(result.text);
+		if (Array.isArray(parsed)) return (parsed as unknown[]).filter((s): s is string => typeof s === "string" && s.length > 0).slice(0, 5);
+		return [];
 	};
 
 	// ─── seed prompt for new session ──────────────────────────────────
@@ -330,39 +389,30 @@ export default function (pi: ExtensionAPI) {
 			`Context at ${(ratio * 100).toFixed(0)}% — triggering wiki rotation (threshold ${(state.settings.triggerFillRatio * 100).toFixed(0)}%).`,
 			"info",
 		);
-		state.pendingRotateMarker = true;
 		// Use ctx.compact to swap context after the wiki update completes via session_before_compact.
 		ctx.compact({
 			customInstructions: "WIKI_KEEPER_ROTATE",
-			onComplete: () => {
-				state.pendingRotateMarker = false;
-			},
 			onError: (err) => {
-				state.pendingRotateMarker = false;
 				notify(ctx, `wiki rotation compaction failed: ${err.message}`, "error");
 			},
 		});
 	});
 
-	// Replace pi's default compaction with our wiki cycle when WE triggered it.
+	// Replace pi's default compaction with our wiki cycle ONLY when we explicitly triggered it.
+	// Manual /compact (or any other extension's compaction) flows through unmodified.
 	pi.on("session_before_compact", async (event, ctx) => {
-		if (!state.pendingRotateMarker && event.customInstructions !== "WIKI_KEEPER_ROTATE") {
-			return; // let pi do its normal compaction
-		}
+		if (event.customInstructions !== "WIKI_KEEPER_ROTATE") return;
 		const { preparation } = event;
 		const all = [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
 		const transcript = serializeConversation(convertToLlm(all));
 		const result = await runWikiCycle({ ctx, preparedTranscript: transcript, reason: "auto" });
 		const seed = buildSeed(ctx, "");
-		const summary = [
-			`# Wiki rotation summary`,
-			"",
-			result.ok ? result.summary : `(wiki update failed: ${result.error})`,
-			"",
-			"---",
-			"",
-			seed,
-		].join("\n");
+		const rawSummary = result.ok ? result.summary : `(wiki update failed: ${result.error})`;
+		const capped =
+			rawSummary.length > MAX_ROTATION_SUMMARY_CHARS
+				? rawSummary.slice(0, MAX_ROTATION_SUMMARY_CHARS - 1).trimEnd() + "…"
+				: rawSummary;
+		const summary = [`# Wiki rotation`, "", capped, "", "---", "", seed].join("\n");
 		return {
 			compaction: {
 				summary,
@@ -371,6 +421,19 @@ export default function (pi: ExtensionAPI) {
 				details: { source: "wiki-keeper", opsApplied: result.opsApplied },
 			},
 		};
+	});
+
+	// One-shot system prompt addendum: enforce "wiki first" discipline when the wiki has content.
+	pi.on("before_agent_start", async (event, ctx) => {
+		if (state.disciplineNudgeApplied) return;
+		const paths = resolveWikiPaths(process.cwd(), state.settings);
+		const log = readFileIfExists(paths.logMd);
+		if (!log) return;
+		const hasIngest = /^## \[[^\]]+\] (ingest|manual-flush|manual-rotate|auto)/m.test(log);
+		if (!hasIngest) return;
+		state.disciplineNudgeApplied = true;
+		const addendum = `\n\n## Wiki discipline (pi-plug)\n\nThis project has a knowledge wiki at \`./${state.settings.wikiDir}/\` (qmd collection: \`${state.settings.qmdCollection}\`).\nBefore reading any project source file, call the \`wiki_query\` tool. Only fall back to direct \`read\` when the wiki has no relevant hit.\nThe wiki is the authoritative, accumulated knowledge — your prior sessions have already condensed findings there.`;
+		return { systemPrompt: event.systemPrompt + addendum };
 	});
 
 	// ─── tools ────────────────────────────────────────────────────────
@@ -459,6 +522,36 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("wiki:undo", {
+		description: "Restore the wiki to its state before the last cycle (uses the most recent snapshot).",
+		handler: async (_args, ctx) => {
+			const paths = resolveWikiPaths(process.cwd(), state.settings);
+			const snapshots = listSnapshots(paths.root);
+			if (snapshots.length === 0) {
+				notify(ctx, "wiki: no snapshots to restore from.", "warning");
+				return;
+			}
+			const lock = await acquireWikiLock(join(paths.root, ".lock"), sessionIdOf(ctx), { timeoutMs: LOCK_TIMEOUT_MS });
+			if (!lock) {
+				notify(ctx, "wiki: another session holds the lock; try again shortly.", "warning");
+				return;
+			}
+			try {
+				const restored = restoreLatestSnapshot(paths.root);
+				if (!restored) {
+					notify(ctx, "wiki: snapshot restore failed.", "error");
+					return;
+				}
+				try {
+					await qmdEmbed(state.settings.qmdCollection, process.cwd());
+				} catch {}
+				notify(ctx, `wiki: restored snapshot ${restored.stamp}. ${snapshots.length - 1} snapshot(s) remain.`, "info");
+			} finally {
+				lock.release();
+			}
+		},
+	});
+
 	pi.registerCommand("wiki:status", {
 		description: "Show wiki + qmd status.",
 		handler: async (_args, ctx) => {
@@ -466,9 +559,14 @@ export default function (pi: ExtensionAPI) {
 			const ratio = computeFillRatio(ctx);
 			const qmdHas = await qmdAvailable();
 			const qmdSt = qmdHas ? await qmdStatus(state.settings.qmdCollection) : null;
+			const snapshots = listSnapshots(paths.root);
+			const lockMeta = readFileIfExists(join(paths.root, ".lock"));
 			const lines = [
 				`wiki dir:        ${relative(process.cwd(), paths.root) || paths.root}`,
 				`bootstrapped:    ${isWikiBootstrapped(paths) ? "yes" : "no"}`,
+				`session id:      ${sessionIdOf(ctx)}`,
+				`lock:            ${lockMeta ? lockMeta.replace(/\s+/g, " ").slice(0, 120) : "free"}`,
+				`snapshots:       ${snapshots.length} (latest: ${snapshots[0]?.stamp ?? "none"})`,
 				`context fill:    ${ratio === null ? "unknown" : (ratio * 100).toFixed(1) + "%"} (trigger ${(state.settings.triggerFillRatio * 100).toFixed(0)}%)`,
 				`armed:           ${state.armed ? "yes" : "no (will re-arm under " + Math.round(state.settings.triggerFillRatio * 80) + "%)"}`,
 				`qmd installed:   ${qmdHas ? "yes" : "no — install with: npm i -g @tobilu/qmd"}`,

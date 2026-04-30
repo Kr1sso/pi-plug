@@ -49,6 +49,7 @@ Your context is then replaced with a thin "wiki rotated — query first" pointer
 |---|---|
 | `/wiki:flush` | Translate current session → wiki updates. Don't touch context. |
 | `/wiki:rotate` | Translate → start a fresh session seeded from the wiki. |
+| `/wiki:undo` | Restore the wiki from the most recent pre-cycle snapshot. |
 | `/wiki:query <q>` | Manual qmd query against the wiki. |
 | `/wiki:lint` | Run dead-link / orphan / contradiction check. |
 | `/wiki:status` | Show context fill, qmd state, settings. |
@@ -89,6 +90,39 @@ Your context is then replaced with a thin "wiki rotated — query first" pointer
 | `autoScaffold` | `true` | Bootstrap `wiki/` on first run. |
 | `translationModelProvider` / `translationModelId` | `""` | Override the translation model. Empty = current `ctx.model`. |
 | `cooldownMs` | `60000` | Min delay between auto-rotations. |
+
+## Multi-session safety (5 agents on one codebase)
+
+Multiple pi sessions can run against the same project simultaneously. Handled with:
+
+- **Cross-process lock** (`wiki/.lock`): only one session writes the wiki at a time. Others wait up to 45s, then skip (retry on next trigger). Stale locks (dead PID or >5 min old) are auto-cleaned.
+- **Pre-cycle snapshots** (`wiki/.snapshots/<ts>/`): the wiki is snapshotted before every write. Last 5 kept. `/wiki:undo` restores from the latest.
+- **Session-id tagged log entries**: every `log.md` line includes the session id, so concurrent activity is traceable with `grep`.
+- **Reads stay free**: `wiki_query` and `/wiki:query` never take the lock; only the cycle does.
+
+Not protected: two sessions whose translations both touch the same page concurrently. The lock serializes them, but if B started its translation before A finished, B is operating on a stale view and may emit conflicting ops. Lint surfaces these as `> [!contradiction]` callouts. True multi-tenant correctness requires per-session ingest journals — not in v0.x.
+
+## Wiki-first discipline
+
+Once the wiki has at least one ingest entry, the extension appends a one-shot addendum to the system prompt of every new session:
+
+> This project has a knowledge wiki at `./wiki/`. Before reading any project source file, call the `wiki_query` tool. Only fall back to direct `read` when the wiki has no relevant hit.
+
+This is in addition to the `wiki_query` tool's own description — two reinforcement layers because models tend to ignore single-source nudges.
+
+## First-run smoke test
+
+```bash
+pi install git:github.com/Kr1sso/pi-plug          # global; or -l for project-local
+pi                                                # quit
+pi                                                # start again — wiki-keeper now in [Extensions]
+# inside pi:
+/wiki:status                                      # confirm setup, qmd, fill ratio
+/wiki:flush                                       # force a cycle, watch wiki/ populate
+ls wiki/                                          # index.md, log.md, schema.md, entities/, ...
+```
+
+If nothing appears in `[Extensions]` after restart, run `pi -e ./.pi/git/github.com/Kr1sso/pi-plug/extensions/wiki-keeper/index.ts` to surface load errors.
 
 ## Why these design choices
 
