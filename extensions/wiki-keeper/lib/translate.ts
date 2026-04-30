@@ -50,6 +50,11 @@ export async function callModelText(
 			{ systemPrompt, messages },
 			{ apiKey: auth.apiKey, headers: auth.headers, maxTokens, signal },
 		);
+		const stopReason = (response as { stopReason?: string }).stopReason;
+		const apiErrorMessage = (response as { errorMessage?: string }).errorMessage;
+		if (stopReason === "error" || stopReason === "aborted") {
+			return { ok: false, text: "", error: `model ${stopReason}${apiErrorMessage ? `: ${apiErrorMessage}` : " (no errorMessage from provider)"}` };
+		}
 		const text = response.content
 			.filter((c): c is { type: "text"; text: string } => c.type === "text")
 			.map((c) => c.text)
@@ -110,6 +115,20 @@ export async function callModelTextJson(
 				.join("\n");
 			lastText = text;
 			lastStopReason = (response as { stopReason?: string }).stopReason;
+			const apiErrorMessage = (response as { errorMessage?: string }).errorMessage;
+
+			// Hard API failure (rate limit, 5xx, context-too-large, auth, etc.) — retry won't help
+			// and may make things worse. Surface the underlying errorMessage and bail immediately.
+			if (lastStopReason === "error" || lastStopReason === "aborted") {
+				return {
+					ok: false,
+					text: lastText,
+					error: `model ${lastStopReason}${apiErrorMessage ? `: ${apiErrorMessage}` : " (no errorMessage from provider)"}`,
+					attempts: attempt,
+					stopReason: lastStopReason,
+				};
+			}
+
 			const parsed = extractJson(text);
 			if (parsed !== undefined) return { ok: true, text, parsed, attempts: attempt };
 
