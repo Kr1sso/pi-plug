@@ -24,7 +24,19 @@ import {
 	type WikiOp,
 } from "./lib/wiki-fs.js";
 import { qmdAvailable, qmdCollectionIsEmpty, qmdEmbed, qmdEnsureCollection, qmdQuery, qmdStatus } from "./lib/qmd.js";
-import { callModelText, extractJson, resolveTranslationModel } from "./lib/translate.js";
+import { callModelText, callModelTextJson, extractJson, resolveTranslationModel } from "./lib/translate.js";
+
+// Shared JSON-shape reminder used when retrying a flush after the first response is unparseable.
+const OPS_JSON_SHAPE_REMINDER = `{
+  "summary": "one-paragraph description",
+  "ops": [
+    { "op": "create"|"overwrite"|"append", "path": "...", "content": "..." },
+    { "op": "replace_section", "path": "...", "heading": "## Heading", "content": "..." },
+    { "op": "log", "entry": "## [YYYY-MM-DD HH:MM] kind | <session-id> | one-line summary" }
+  ]
+}
+
+If there is nothing to record, output exactly: {"summary":"no changes","ops":[]}`;
 import { peekProject, renderPeek } from "./lib/scaffold.js";
 import { acquireWikiLock, listSnapshots, restoreLatestSnapshot, snapshotWiki } from "./lib/lock.js";
 import { detectDrift, isGitRepo, listSourceTrackingPages, suggestSyncTargets, summarizeDrift, writeLastSync } from "./lib/sync.js";
@@ -384,10 +396,13 @@ export default function (pi: ExtensionAPI) {
 				.filter(Boolean)
 				.join("\n\n---\n\n");
 
-			const llm = await callModelText(ctx, resolved.model, PROMPT_INGEST, userText, ctx.signal, 8192);
-			if (!llm.ok) return { ok: false, summary: "", opsApplied: 0, error: `translate failed: ${llm.error}` };
-
-			const parsed = extractJson(llm.text) as { summary?: string; ops?: WikiOp[] } | undefined;
+			const llm = await callModelTextJson(ctx, resolved.model, PROMPT_INGEST, userText, ctx.signal, 8192, { jsonShapeReminder: OPS_JSON_SHAPE_REMINDER });
+			if (!llm.ok) {
+				const suffix = llm.attempts > 1 ? ` (after ${llm.attempts} attempt(s))` : "";
+				return { ok: false, summary: "", opsApplied: 0, error: `translate failed${suffix}: ${llm.error}` };
+			}
+			if (llm.attempts > 1) updatePhase(ctx, `recovered JSON on attempt ${llm.attempts}`);
+			const parsed = llm.parsed as { summary?: string; ops?: WikiOp[] } | undefined;
 			if (!parsed) return { ok: false, summary: "", opsApplied: 0, error: "translation produced unparseable JSON" };
 			const ops: WikiOp[] = Array.isArray(parsed.ops) ? parsed.ops : [];
 
@@ -570,10 +585,13 @@ export default function (pi: ExtensionAPI) {
 			].filter(Boolean).join("\n\n---\n\n");
 
 			updatePhase(ctx, "calling translation model");
-			const llm = await callModelText(ctx, resolved.model, PROMPT_SYNC, userText, ctx.signal, 8192);
-			if (!llm.ok) return { ok: false, summary: "", targets: targets.length, opsApplied: 0, error: `sync translate failed: ${llm.error}` };
-
-			const parsed = extractJson(llm.text) as { summary?: string; ops?: WikiOp[] } | undefined;
+			const llm = await callModelTextJson(ctx, resolved.model, PROMPT_SYNC, userText, ctx.signal, 8192, { jsonShapeReminder: OPS_JSON_SHAPE_REMINDER });
+			if (!llm.ok) {
+				const suffix = llm.attempts > 1 ? ` (after ${llm.attempts} attempt(s))` : "";
+				return { ok: false, summary: "", targets: targets.length, opsApplied: 0, error: `sync translate failed${suffix}: ${llm.error}` };
+			}
+			if (llm.attempts > 1) updatePhase(ctx, `recovered JSON on attempt ${llm.attempts}`);
+			const parsed = llm.parsed as { summary?: string; ops?: WikiOp[] } | undefined;
 			if (!parsed) return { ok: false, summary: "", targets: targets.length, opsApplied: 0, error: "sync produced unparseable JSON" };
 			const ops: WikiOp[] = Array.isArray(parsed.ops) ? parsed.ops : [];
 
@@ -701,11 +719,13 @@ export default function (pi: ExtensionAPI) {
 			if (!resolved.model) {
 				return { ok: false, summary: "", opsApplied: 0, remainingDead: lintBefore.deadLinks.length, remainingOrphans: lintBefore.orphans.length, error: resolved.error };
 			}
-			const llm = await callModelText(ctx, resolved.model, PROMPT_FIX, userText, ctx.signal, 8192);
+			const llm = await callModelTextJson(ctx, resolved.model, PROMPT_FIX, userText, ctx.signal, 8192, { jsonShapeReminder: OPS_JSON_SHAPE_REMINDER });
 			if (!llm.ok) {
-				return { ok: false, summary: "", opsApplied: 0, remainingDead: lintBefore.deadLinks.length, remainingOrphans: lintBefore.orphans.length, error: `repair translate failed: ${llm.error}` };
+				const suffix = llm.attempts > 1 ? ` (after ${llm.attempts} attempt(s))` : "";
+				return { ok: false, summary: "", opsApplied: 0, remainingDead: lintBefore.deadLinks.length, remainingOrphans: lintBefore.orphans.length, error: `repair translate failed${suffix}: ${llm.error}` };
 			}
-			const parsed = extractJson(llm.text) as { summary?: string; ops?: WikiOp[] } | undefined;
+			if (llm.attempts > 1) updatePhase(ctx, `recovered JSON on attempt ${llm.attempts}`);
+			const parsed = llm.parsed as { summary?: string; ops?: WikiOp[] } | undefined;
 			if (!parsed) {
 				return { ok: false, summary: "", opsApplied: 0, remainingDead: lintBefore.deadLinks.length, remainingOrphans: lintBefore.orphans.length, error: "repair produced unparseable JSON" };
 			}
