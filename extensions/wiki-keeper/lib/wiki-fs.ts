@@ -17,6 +17,9 @@ export function listMarkdownFiles(root: string): string[] {
 	const walk = (dir: string) => {
 		if (!existsSync(dir)) return;
 		for (const name of readdirSync(dir)) {
+			// Skip dotfile/scaffolding directories (e.g. .snapshots, .git) so they
+			// don't pollute lint as dead links/orphans. Snapshots are frozen archives.
+			if (name.startsWith(".")) continue;
 			const full = join(dir, name);
 			let st;
 			try {
