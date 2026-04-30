@@ -1,6 +1,5 @@
-import { basename } from "node:path";
-import { readFileSync } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { basename, dirname, join, relative, resolve as resolvePath } from "node:path";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import {
@@ -28,8 +27,6 @@ import { peekProject, renderPeek } from "./lib/scaffold.js";
 import { acquireWikiLock, listSnapshots, restoreLatestSnapshot, snapshotWiki } from "./lib/lock.js";
 import { detectDrift, isGitRepo, listSourceTrackingPages, suggestSyncTargets, summarizeDrift, writeLastSync } from "./lib/sync.js";
 import { gitBlobShaOfFile, parseDoc, serializeDoc, fileMtime } from "./lib/frontmatter.js";
-import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { resolve as resolvePath } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 

@@ -10,7 +10,7 @@ export interface WikiKeeperSettings {
 	rawSubdir: string;
 	/** qmd collection name. */
 	qmdCollection: string;
-	/** Whether the auto-trigger replaces context after wiki update. */
+	/** Whether the auto-trigger replaces context after wiki update. If false, only notifies and the user must run /wiki:rotate manually. */
 	autoCompactOnTrigger: boolean;
 	/** Whether the cycle runs lint (dead links, orphans, contradictions). */
 	lint: boolean;
@@ -22,6 +22,14 @@ export interface WikiKeeperSettings {
 	translationModelProvider: string;
 	/** Cooldown after a cycle before another auto-trigger (ms). */
 	cooldownMs: number;
+	/** How many pre-cycle snapshots to keep in wiki/.snapshots/. */
+	keepSnapshots: number;
+	/** Auto-embed qmd on session_start if wiki is bootstrapped but local index is empty. */
+	qmdAutoEmbedOnStart: boolean;
+	/** Skip the keyphrase pre-fetch if wiki has fewer than this many pages (no point grounding against an empty wiki). */
+	prefetchMinPages: number;
+	/** When log.md exceeds this many entries (lines starting `## [`), suggest /wiki:archive on session_start. */
+	logArchiveSuggestEntries: number;
 }
 
 export const DEFAULT_SETTINGS: WikiKeeperSettings = {
@@ -35,6 +43,10 @@ export const DEFAULT_SETTINGS: WikiKeeperSettings = {
 	translationModelId: "",
 	translationModelProvider: "",
 	cooldownMs: 60_000,
+	keepSnapshots: 10,
+	qmdAutoEmbedOnStart: true,
+	prefetchMinPages: 5,
+	logArchiveSuggestEntries: 500,
 };
 
 interface SettingsFile {

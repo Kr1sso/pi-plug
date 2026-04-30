@@ -102,7 +102,7 @@ export interface SnapshotInfo {
 }
 
 const SNAPSHOT_DIR = ".snapshots";
-const KEEP_SNAPSHOTS = 5;
+const DEFAULT_KEEP_SNAPSHOTS = 10;
 
 function listSnapshotsRaw(wikiRoot: string): SnapshotInfo[] {
 	const dir = join(wikiRoot, SNAPSHOT_DIR);
@@ -143,7 +143,7 @@ function copyRec(src: string, dst: string): void {
 	}
 }
 
-export function snapshotWiki(wikiRoot: string): SnapshotInfo | undefined {
+export function snapshotWiki(wikiRoot: string, keep = DEFAULT_KEEP_SNAPSHOTS): SnapshotInfo | undefined {
 	if (!existsSync(wikiRoot)) return undefined;
 	const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 	const dest = join(wikiRoot, SNAPSHOT_DIR, stamp);
@@ -152,13 +152,13 @@ export function snapshotWiki(wikiRoot: string): SnapshotInfo | undefined {
 		if (entry === SNAPSHOT_DIR || entry === ".lock") continue;
 		copyRec(join(wikiRoot, entry), join(dest, entry));
 	}
-	pruneSnapshots(wikiRoot);
+	pruneSnapshots(wikiRoot, keep);
 	return { path: dest, timestamp: Date.now(), stamp };
 }
 
-function pruneSnapshots(wikiRoot: string): void {
+function pruneSnapshots(wikiRoot: string, keep: number): void {
 	const all = listSnapshotsRaw(wikiRoot);
-	for (const old of all.slice(KEEP_SNAPSHOTS)) {
+	for (const old of all.slice(keep)) {
 		try {
 			rmSync(old.path, { recursive: true, force: true });
 		} catch {}
