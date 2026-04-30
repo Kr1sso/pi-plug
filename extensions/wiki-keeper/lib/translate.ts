@@ -65,6 +65,12 @@ export async function callModelText(
  * retry once with a corrective follow-up that quotes the expected shape and reminds the
  * model to consult wiki/schema.md before answering.
  *
+ * On `stopReason === "length"` we tell the model its previous reply was truncated and
+ * ask for a smaller / more concise payload — retrying with the same prompt would just
+ * truncate again at the same byte.
+ *
+ * `opts.debugDumpPath`: if set, the last bad raw response is written here for inspection.
+ *
  * Returns the parsed JSON plus the raw text and number of attempts (1 or 2).
  */
 export async function callModelTextJson(
@@ -74,8 +80,8 @@ export async function callModelTextJson(
 	userText: string,
 	signal: AbortSignal | undefined,
 	maxTokens = 8192,
-	opts: { jsonShapeReminder?: string; retries?: number } = {},
-): Promise<{ ok: true; text: string; parsed: unknown; attempts: number } | { ok: false; text: string; error: string; attempts: number }> {
+	opts: { jsonShapeReminder?: string; retries?: number; debugDumpPath?: string } = {},
+): Promise<{ ok: true; text: string; parsed: unknown; attempts: number } | { ok: false; text: string; error: string; attempts: number; stopReason?: string }> {
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 	if (!auth.ok) return { ok: false, text: "", error: `auth failed: ${auth.error}`, attempts: 0 };
 	if (!auth.apiKey) return { ok: false, text: "", error: `no API key for ${model.provider}`, attempts: 0 };
@@ -90,6 +96,7 @@ export async function callModelTextJson(
 
 	let lastText = "";
 	let lastError = "";
+	let lastStopReason: string | undefined;
 	for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
 		try {
 			const response = await complete(
@@ -102,29 +109,65 @@ export async function callModelTextJson(
 				.map((c) => c.text)
 				.join("\n");
 			lastText = text;
+			lastStopReason = (response as { stopReason?: string }).stopReason;
 			const parsed = extractJson(text);
 			if (parsed !== undefined) return { ok: true, text, parsed, attempts: attempt };
 
-			lastError = "unparseable JSON";
+			const truncated = lastStopReason === "length";
+			lastError = truncated ? "response truncated at token limit" : "unparseable JSON";
 			if (attempt > maxRetries) break;
 
 			// Corrective turn: feed back the bad output and remind the model what we expect.
 			messages.push({ role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() });
 			const reminder = opts.jsonShapeReminder?.trim();
-			const correctiveText = [
-				"Your previous response could not be parsed as JSON.",
-				"Re-read `wiki/schema.md` (provided above) and the system prompt's JSON shape specification, then reply again.",
-				reminder ? `Expected shape:\n${reminder}` : "",
-				"Output ONLY a single valid JSON object. No prose. No markdown fences. No commentary before or after. Begin your reply with `{` and end it with `}`.",
-			]
-				.filter(Boolean)
-				.join("\n\n");
+			const correctiveText = truncated
+				? [
+						"Your previous response was cut off at the model's token limit, so it is not parseable JSON.",
+						"Reply again with a SMALLER payload that fits in the budget:",
+						"• Drop low-value ops; keep only the most important changes.",
+						"• Prefer `append` / `replace_section` over full-file `overwrite`.",
+						"• Trim verbose `content` strings — wiki pages should be terse reference, not narrative.",
+						reminder ? `Expected shape:\n${reminder}` : "",
+						"Output ONLY a single valid JSON object. No prose. No fences. Begin with `{` and end with `}`.",
+					]
+						.filter(Boolean)
+						.join("\n\n")
+				: [
+						"Your previous response could not be parsed as JSON.",
+						"Re-read `wiki/schema.md` (provided above) and the system prompt's JSON shape specification, then reply again.",
+						reminder ? `Expected shape:\n${reminder}` : "",
+						"Output ONLY a single valid JSON object. No prose. No markdown fences. No commentary before or after. Begin your reply with `{` and end it with `}`.",
+					]
+						.filter(Boolean)
+						.join("\n\n");
 			messages.push({ role: "user", content: [{ type: "text", text: correctiveText }], timestamp: Date.now() });
 		} catch (err) {
-			return { ok: false, text: lastText, error: err instanceof Error ? err.message : String(err), attempts: attempt };
+			return { ok: false, text: lastText, error: err instanceof Error ? err.message : String(err), attempts: attempt, stopReason: lastStopReason };
 		}
 	}
-	return { ok: false, text: lastText, error: `${lastError} after ${maxRetries + 1} attempt(s)`, attempts: maxRetries + 1 };
+
+	// Persist the last bad payload for offline inspection.
+	if (opts.debugDumpPath && lastText) {
+		try {
+			const { mkdirSync, writeFileSync } = await import("node:fs");
+			const { dirname } = await import("node:path");
+			mkdirSync(dirname(opts.debugDumpPath), { recursive: true });
+			const header = `// Captured ${new Date().toISOString()} | stopReason=${lastStopReason ?? "unknown"} | error=${lastError}\n// length=${lastText.length} chars\n\n`;
+			writeFileSync(opts.debugDumpPath, header + lastText);
+		} catch {}
+	}
+
+	const snippet = lastText
+		? ` | head: ${JSON.stringify(lastText.slice(0, 160))}${lastText.length > 160 ? "…" : ""} | tail: ${JSON.stringify(lastText.slice(-120))}`
+		: "";
+	const dumpHint = opts.debugDumpPath && lastText ? ` | dumped to ${opts.debugDumpPath}` : "";
+	return {
+		ok: false,
+		text: lastText,
+		error: `${lastError} after ${maxRetries + 1} attempt(s) (stopReason=${lastStopReason ?? "unknown"}, ${lastText.length} chars)${snippet}${dumpHint}`,
+		attempts: maxRetries + 1,
+		stopReason: lastStopReason,
+	};
 }
 
 /** Best-effort JSON extraction: tolerates code fences and surrounding chatter. */
