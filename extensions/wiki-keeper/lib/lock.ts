@@ -70,7 +70,12 @@ export async function acquireWikiLock(
 				release() {
 					try {
 						const current = readLock(lockPath);
-						if (current && current.pid === process.pid && current.startedAt === meta.startedAt) {
+						if (
+							current &&
+							current.pid === process.pid &&
+							current.startedAt === meta.startedAt &&
+							current.sessionId === meta.sessionId
+						) {
 							unlinkSync(lockPath);
 						}
 					} catch {}

@@ -317,3 +317,253 @@ describe("lintWiki — minimal wiki", () => {
 		}
 	});
 });
+
+import { applyOps, replaceSection, archiveLog, countLogEntries, type WikiOp } from "./wiki-fs.ts";
+import { existsSync as _exists, readFileSync as _readFile, writeFileSync as _writeFile } from "node:fs";
+
+describe("applyOps", () => {
+	it("creates a new file", () => {
+		const { tmp, paths } = makeWiki(SKELETON);
+		try {
+			const r = applyOps(paths, [{ op: "create", path: "entities/foo.md", content: "# Foo\n" }]);
+			assert.equal(r.created.length, 1);
+			assert.equal(r.skipped.length, 0);
+			assert.ok(_exists(join(paths.root, "entities/foo.md")));
+		} finally { rmSync(tmp, { recursive: true, force: true }); }
+	});
+
+	it("create skips when file already exists", () => {
+		const { tmp, paths } = makeWiki({ ...SKELETON, "entities/foo.md": "# old\n" });
+		try {
+			const r = applyOps(paths, [{ op: "create", path: "entities/foo.md", content: "# new\n" }]);
+			assert.equal(r.created.length, 0);
+			assert.equal(r.skipped.length, 1);
+			assert.match(r.skipped[0].reason, /exists/);
+			// File NOT overwritten:
+						assert.equal(_readFile(join(paths.root, "entities/foo.md"), "utf8"), "# old\n");
+		} finally { rmSync(tmp, { recursive: true, force: true }); }
+	});
+
+	it("overwrite replaces existing file", () => {
+		const { tmp, paths } = makeWiki({ ...SKELETON, "entities/x.md": "# v1\n" });
+		try {
+			const r = applyOps(paths, [{ op: "overwrite", path: "entities/x.md", content: "# v2\n" }]);
+			assert.equal(r.updated.length, 1);
+						assert.equal(_readFile(join(paths.root, "entities/x.md"), "utf8"), "# v2\n");
+		} finally { rmSync(tmp, { recursive: true, force: true }); }
+	});
+
+	it("overwrite creates the file if missing", () => {
+		const { tmp, paths } = makeWiki(SKELETON);
+		try {
+			const r = applyOps(paths, [{ op: "overwrite", path: "concepts/new.md", content: "# new\n" }]);
+			assert.equal(r.created.length, 1);
+		} finally { rmSync(tmp, { recursive: true, force: true }); }
+	});
+
+	it("append adds content with newline separation", () => {
+		const { tmp, paths } = makeWiki({ ...SKELETON, "log.md": "# Log\nline1" });
+		try {
+			applyOps(paths, [{ op: "append", path: "log.md", content: "line2" }]);
+						const t = _readFile(join(paths.root, "log.md"), "utf8");
+			assert.match(t, /line1\nline2\n/);
+		} finally { rmSync(tmp, { recursive: true, force: true }); }
+	});
+
+	it("delete removes existing file", () => {
+		const { tmp, paths } = makeWiki({ ...SKELETON, "entities/gone.md": "# gone\n" });
+		try {
+			const r = applyOps(paths, [{ op: "delete", path: "entities/gone.md" }]);
+			assert.equal(r.updated.length, 1);
+			assert.equal(_exists(join(paths.root, "entities/gone.md")), false);
+		} finally { rmSync(tmp, { recursive: true, force: true }); }
+	});
+
+	it("delete skips when file already absent", () => {
+		const { tmp, paths } = makeWiki(SKELETON);
+		try {
+			const r = applyOps(paths, [{ op: "delete", path: "entities/never.md" }]);
+			assert.equal(r.skipped.length, 1);
+			assert.match(r.skipped[0].reason, /already absent/);
+		} finally { rmSync(tmp, { recursive: true, force: true }); }
+	});
+
+	it("log appends to log.md", () => {
+		const { tmp, paths } = makeWiki(SKELETON);
+		try {
+			applyOps(paths, [{ op: "log", entry: "## [now] ingest | s | hi" }]);
+						assert.match(_readFile(paths.logMd, "utf8"), /## \[now\] ingest \| s \| hi/);
+		} finally { rmSync(tmp, { recursive: true, force: true }); }
+	});
+
+	it("rejects path escaping wiki root", () => {
+		const { tmp, paths } = makeWiki(SKELETON);
+		try {
+			const r = applyOps(paths, [{ op: "create", path: "../escape.md", content: "x" }]);
+			assert.equal(r.skipped.length, 1);
+			assert.match(r.skipped[0].reason, /escapes/);
+		} finally { rmSync(tmp, { recursive: true, force: true }); }
+	});
+
+	it("creates intermediate directories for nested paths", () => {
+		const { tmp, paths } = makeWiki(SKELETON);
+		try {
+			applyOps(paths, [{ op: "create", path: "deep/nested/page.md", content: "# x\n" }]);
+			assert.ok(_exists(join(paths.root, "deep/nested/page.md")));
+		} finally { rmSync(tmp, { recursive: true, force: true }); }
+	});
+
+	it("captures errors in errors[] without crashing", () => {
+		const { tmp, paths } = makeWiki(SKELETON);
+		try {
+			// Try to write to a path that becomes invalid: write a file at "entities" then try to create under it
+						_writeFile(join(paths.root, "blocker.md"), "x");
+			const r = applyOps(paths, [{ op: "create", path: "blocker.md/child.md", content: "x" }]);
+			assert.ok(r.errors.length >= 1, "expected an error for trying to create under a file");
+		} finally { rmSync(tmp, { recursive: true, force: true }); }
+	});
+
+	it("applies multiple ops in order", () => {
+		const { tmp, paths } = makeWiki(SKELETON);
+		try {
+			const ops: WikiOp[] = [
+				{ op: "create", path: "concepts/a.md", content: "# A\n" },
+				{ op: "create", path: "concepts/b.md", content: "# B\n" },
+				{ op: "log", entry: "## [now] ingest | s | a+b" },
+			];
+			const r = applyOps(paths, ops);
+			assert.equal(r.created.length, 2);
+		} finally { rmSync(tmp, { recursive: true, force: true }); }
+	});
+});
+
+describe("replaceSection", () => {
+	it("replaces a section bounded by next sibling heading", () => {
+		const orig = "# Doc\n\n## A\nold A\n\n## B\nkeep B\n";
+		const out = replaceSection(orig, "## A", "new A");
+		assert.match(out, /## A\nnew A/);
+		assert.match(out, /## B\nkeep B/);
+		assert.ok(!out.includes("old A"));
+	});
+
+	it("appends section when heading not found", () => {
+		const orig = "# Doc\n\nbody\n";
+		const out = replaceSection(orig, "## New", "new content");
+		assert.match(out, /## New\nnew content/);
+		assert.match(out, /^# Doc/);
+	});
+
+	it("handles section that runs to end of file", () => {
+		const orig = "# Doc\n\n## Last\noriginal last\n";
+		const out = replaceSection(orig, "## Last", "replaced last");
+		assert.match(out, /## Last\nreplaced last/);
+		assert.ok(!out.includes("original last"));
+	});
+
+	it("respects heading depth (## stops at ## or #, not at ###)", () => {
+		const orig = "## A\nA body\n\n### A.1\nsub\n\n## B\nB body\n";
+		const out = replaceSection(orig, "## A", "new A");
+		// ### A.1 is part of A's section (deeper), so it should be replaced too
+		assert.ok(!out.includes("### A.1"));
+		assert.match(out, /## B\nB body/);
+	});
+
+	it("appends as plain text when heading lacks # prefix", () => {
+		const orig = "body";
+		const out = replaceSection(orig, "Plain Heading", "stuff");
+		assert.match(out, /Plain Heading/);
+	});
+});
+
+describe("countLogEntries", () => {
+	it("returns 0 for missing file", () => {
+		assert.equal(countLogEntries("/nonexistent/log.md"), 0);
+	});
+
+	it("counts ## [...] lines, ignoring header and other ## lines", () => {
+		const tmp = mkdtempSync(join(tmpdir(), "cnt-"));
+		const log = join(tmp, "log.md");
+		writeFileSync(log, "# Wiki Log\n\n## [2026-01-01 12:00] ingest | a\nbody\n\n## Not an entry\n\n## [2026-01-02 12:00] sync | b\n");
+		assert.equal(countLogEntries(log), 2);
+	});
+
+	it("returns 0 for empty file", () => {
+		const tmp = mkdtempSync(join(tmpdir(), "cnt-"));
+		const log = join(tmp, "log.md");
+		writeFileSync(log, "");
+		assert.equal(countLogEntries(log), 0);
+	});
+});
+
+describe("archiveLog", () => {
+	function makeLog(entries: number): string {
+		const tmp = mkdtempSync(join(tmpdir(), "arc-"));
+		const log = join(tmp, "log.md");
+		const blocks: string[] = ["# Wiki Log", ""];
+		for (let i = 0; i < entries; i++) {
+			const month = (i % 4) + 1;
+			blocks.push(`## [2026-0${month}-15 12:00] ingest | s${i} | entry ${i}`);
+			blocks.push(`body for ${i}`);
+			blocks.push("");
+		}
+		writeFileSync(log, blocks.join("\n"));
+		return log;
+	}
+
+	it("does nothing when entries <= keepRecent", () => {
+		const log = makeLog(3);
+		const r = archiveLog(log, 5);
+		assert.equal(r.archivedEntries, 0);
+		assert.equal(r.archiveFiles.length, 0);
+		assert.equal(r.keptEntries, 3);
+	});
+
+	it("archives older entries into per-month files, keeps recent", () => {
+		const log = makeLog(12);
+		const r = archiveLog(log, 5);
+		assert.equal(r.archivedEntries, 7);
+		assert.equal(r.keptEntries, 5);
+		// 4 distinct months in our generator → 4 archive files
+		assert.equal(r.archiveFiles.length, 4);
+		// log.md now has only 5 entries
+		assert.equal(countLogEntries(log), 5);
+		// each archive has at least 1 entry, total = 7
+		const total = r.archiveFiles.reduce((s, f) => s + countLogEntries(f), 0);
+		assert.equal(total, 7);
+	});
+
+	it("preserves the # Log header in the trimmed file", () => {
+		const log = makeLog(8);
+		archiveLog(log, 3);
+				assert.match(_readFile(log, "utf8"), /^# Wiki Log/);
+	});
+
+	it("returns zero for missing file", () => {
+		const r = archiveLog("/nonexistent/log.md", 5);
+		assert.equal(r.archivedEntries, 0);
+		assert.equal(r.archiveFiles.length, 0);
+	});
+
+	it("appends to existing archive file rather than overwriting", () => {
+		const log = makeLog(8);
+		const dir = dirname(log);
+		const existing = join(dir, "log-archive-2026-01.md");
+		writeFileSync(existing, "# Wiki Log Archive (2026-01)\n\n## [2025-01-01 00:00] sync | old | preserved\n");
+		archiveLog(log, 3);
+		const text = _readFile(existing, "utf8");
+		assert.match(text, /preserved/, "pre-existing entry must survive");
+		// And the new entries for 2026-01 are appended
+		assert.match(text, /## \[2026-01-/);
+	});
+
+	it("handles 'undated' entries gracefully", () => {
+		const tmp = mkdtempSync(join(tmpdir(), "arc-undated-"));
+		const log = join(tmp, "log.md");
+		writeFileSync(log, "# Wiki Log\n\n## [garbage stamp] ingest | s | x\nbody\n\n## [2026-04-15 12:00] ingest | s | y\nbody\n\n## [2026-04-16 12:00] ingest | s | z\nbody\n");
+		const r = archiveLog(log, 1);
+		assert.equal(r.archivedEntries, 2);
+		// Should produce one undated archive + one 2026-04
+		const names = r.archiveFiles.map((f) => f.split("/").pop()).sort();
+		assert.deepEqual(names, ["log-archive-2026-04.md", "log-archive-undated.md"]);
+	});
+});

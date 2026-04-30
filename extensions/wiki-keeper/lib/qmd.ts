@@ -83,6 +83,19 @@ export async function qmdStatus(collection?: string): Promise<QmdResult> {
 }
 
 /**
+ * Pure helper: classify whether qmd status text indicates an empty collection.
+ * Exported separately so it can be unit-tested without spawning qmd.
+ */
+export function isQmdStatusTextEmpty(stdout: string, stderr = ""): boolean {
+	const text = (stdout + "\n" + stderr).toLowerCase();
+	if (/\b0\s+document(s)?\b/.test(text)) return true;
+	if (/\bdocuments?\s*[:=]\s*0\b/.test(text)) return true;
+	if (/\bno\s+documents?\b/.test(text)) return true;
+	if (/\bcollection\s+empty\b/.test(text)) return true;
+	return false;
+}
+
+/**
  * Best-effort check: does the collection's qmd index appear empty?
  * Parses `qmd status -c <coll>` looking for a doc count. Returns true ONLY when
  * we can confidently parse a 0-doc result; returns false when unparseable so we
@@ -91,11 +104,5 @@ export async function qmdStatus(collection?: string): Promise<QmdResult> {
 export async function qmdCollectionIsEmpty(collection: string): Promise<boolean> {
 	const r = await qmdStatus(collection);
 	if (!r.ok) return false;
-	const text = (r.stdout + "\n" + r.stderr).toLowerCase();
-	// Look for explicit zero indicators across plausible qmd output formats.
-	if (/\b0\s+document(s)?\b/.test(text)) return true;
-	if (/\bdocuments?\s*[:=]\s*0\b/.test(text)) return true;
-	if (/\bno\s+documents?\b/.test(text)) return true;
-	if (/\bcollection\s+empty\b/.test(text)) return true;
-	return false;
+	return isQmdStatusTextEmpty(r.stdout, r.stderr);
 }

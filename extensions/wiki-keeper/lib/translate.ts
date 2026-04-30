@@ -1,7 +1,6 @@
-import { complete, type Message, type Model } from "@mariozechner/pi-ai";
+import type { Message, Model } from "@mariozechner/pi-ai";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { WikiKeeperSettings } from "./settings.js";
-
 /** Resolve the model to use for translation: explicit override, else current ctx.model. */
 export function resolveTranslationModel(
 	ctx: ExtensionContext,
@@ -41,6 +40,11 @@ export async function callModelText(
 		},
 	];
 	try {
+		// Lazy-load the runtime dependency so this module is loadable in test
+		// environments where @mariozechner/pi-ai is not installed (e.g. plain node
+		// outside the pi runtime). The import resolves at call time, by which point
+		// pi has already injected its node_modules into the resolver path.
+		const { complete } = await import("@mariozechner/pi-ai");
 		const response = await complete(
 			model,
 			{ systemPrompt, messages },

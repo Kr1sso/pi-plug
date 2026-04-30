@@ -1,0 +1,2 @@
+# Stray symlinks created by tests for ESM .js→.ts resolution
+*.js
