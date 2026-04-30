@@ -138,6 +138,13 @@ interface SessionState {
 	lastCycleAt: number;
 	armed: boolean; // hysteresis: only fire once per crossing of the threshold
 	disciplineNudgeApplied: boolean; // ensure we only inject systemPrompt addendum once per session
+	/**
+	 * Cached qmd collection name override. Populated when qmd reports that the wiki path
+	 * is already bound to a different collection name (e.g. legacy `project-wiki` from older
+	 * pi-plug installs). When set, all qmd calls use this name instead of the auto-derived
+	 * one to avoid the silent zero-hit failure mode.
+	 */
+	qmdCollectionOverride?: string;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -157,7 +164,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	const getCollection = () => resolveCollectionName(state.settings, process.cwd());
+	const getCollection = () => state.qmdCollectionOverride ?? resolveCollectionName(state.settings, process.cwd());
 
 	const readScaffoldQuality = (paths: ReturnType<typeof resolveWikiPaths>): ScaffoldQuality | undefined => {
 		const raw = readFileIfExists(join(paths.root, SCAFFOLD_QUALITY_FILE));
@@ -263,11 +270,26 @@ export default function (pi: ExtensionAPI) {
 			try { writeFileSync(ga, WIKI_GITATTRIBUTES); } catch {}
 		}
 		// qmd availability is best-effort — warn once per process via state.
-		const collection = resolveCollectionName(state.settings, process.cwd());
+		const desiredCollection = resolveCollectionName(state.settings, process.cwd());
 		if (!(await qmdAvailable())) {
 			notify(ctx, "qmd not found on PATH. Run: npm install -g @tobilu/qmd (or pi-plug install.sh)", "warning");
 		} else {
-			await qmdEnsureCollection(collection, paths.root);
+			const ensured = await qmdEnsureCollection(desiredCollection, paths.root);
+			if (ensured.ok && ensured.actualName && ensured.actualName !== desiredCollection) {
+				// Path-conflict path: qmd already has this wiki bound under a different name (e.g.
+				// legacy `project-wiki`). Use that name for all subsequent qmd calls instead of
+				// silently embedding/querying a non-existent collection (zero-hit failure mode).
+				state.qmdCollectionOverride = ensured.actualName;
+				if (ensured.conflict) {
+					notify(
+						ctx,
+						`qmd: wiki path already registered as '${ensured.actualName}' (preferred name was '${desiredCollection}'). Using existing collection. To rename: qmd collection remove ${ensured.actualName} && restart pi.`,
+						"warning",
+					);
+				}
+			} else if (!ensured.ok) {
+				notify(ctx, `qmd collection setup failed: ${(ensured.stderr || ensured.stdout).trim().slice(0, 300)}`, "error");
+			}
 		}
 		return paths;
 	};

@@ -41,12 +41,36 @@ export async function qmdAvailable(): Promise<boolean> {
 	return r.ok;
 }
 
-export async function qmdEnsureCollection(collection: string, wikiRoot: string): Promise<QmdResult> {
-	// `qmd collection add` is idempotent in modern qmd; ignore "already exists" errors.
+/**
+ * Pure helper: parse qmd's `collection add` output for the path-conflict case.
+ * Returns the existing collection name when qmd reports the wiki path is already
+ * registered under a different name; undefined otherwise. Exported for unit testing.
+ */
+export function parseExistingCollectionFromAddOutput(stdout: string, stderr = ""): string | undefined {
+	const combined = stdout + "\n" + stderr;
+	if (!/already exists for this path/i.test(combined)) return undefined;
+	const match = combined.match(/Name:\s*([A-Za-z0-9_.\-]+)\s*\(qmd:\/\//);
+	return match?.[1];
+}
+
+export async function qmdEnsureCollection(collection: string, wikiRoot: string): Promise<QmdResult & { actualName?: string; conflict?: boolean }> {
+	// `qmd collection add` is idempotent for the same name in modern qmd.
 	const r = await run("qmd", ["collection", "add", wikiRoot, "--name", collection], { timeoutMs: 30_000 });
-	if (!r.ok && /exists/i.test(r.stderr + r.stdout)) {
-		return { ...r, ok: true };
+	if (r.ok) return { ...r, actualName: collection };
+
+	// Path conflict: a DIFFERENT collection name is already bound to this path. qmd's modern
+	// behaviour refuses re-registration. Use the existing name so callers don't silently
+	// embed/query a non-existent collection (zero-hit failure mode).
+	const existing = parseExistingCollectionFromAddOutput(r.stdout, r.stderr);
+	if (existing) {
+		return { ...r, ok: true, actualName: existing, conflict: true };
 	}
+
+	// Same-name-already-exists: idempotent success.
+	if (/exists/i.test(r.stdout + r.stderr)) {
+		return { ...r, ok: true, actualName: collection };
+	}
+
 	return r;
 }
 
