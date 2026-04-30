@@ -7,3 +7,5 @@ node_modules/
 .pi/settings.json
 .pi/git/
 .pi/extensions/
+# pi-plug's own scaffolded wiki — this is the source repo, not a project that needs a wiki
+wiki/
