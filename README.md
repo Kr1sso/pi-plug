@@ -49,6 +49,7 @@ Your context is then replaced with a thin "wiki rotated — query first" pointer
 |---|---|
 | `/wiki:flush` | Translate current session → wiki updates. Don't touch context. |
 | `/wiki:rotate` | Translate → start a fresh session seeded from the wiki. |
+| `/wiki:sync [paths...]` | Sync the wiki with on-disk changes (git diff since last sync, or explicit paths). |
 | `/wiki:undo` | Restore the wiki from the most recent pre-cycle snapshot. |
 | `/wiki:query <q>` | Manual qmd query against the wiki. |
 | `/wiki:lint` | Run dead-link / orphan / contradiction check. |
@@ -90,6 +91,64 @@ Your context is then replaced with a thin "wiki rotated — query first" pointer
 | `autoScaffold` | `true` | Bootstrap `wiki/` on first run. |
 | `translationModelProvider` / `translationModelId` | `""` | Override the translation model. Empty = current `ctx.model`. |
 | `cooldownMs` | `60000` | Min delay between auto-rotations. |
+
+## Visible activity indicator
+
+While any wiki action runs you'll see a 3-line widget above the editor:
+
+```
+● wiki rotation in progress — do not /exit
+  phase: calling translation model
+  elapsed: 8s
+```
+
+Plus a footer entry mirroring the same. Both clear automatically on completion. Shown for: scaffold, rotation, flush, sync, undo. Phases tick through `acquiring lock → snapshot → extracting keyphrases → fetching related pages → calling translation model → applying N ops → linting → qmd reindex`.
+
+## Committing the wiki to git
+
+The wiki is just markdown — commit it. The keeper auto-writes `wiki/.gitignore` so transient state stays out:
+
+```
+.lock
+.snapshots/
+lint-report.md
+```
+
+What you DO commit: `index.md`, `log.md`, `schema.md`, `entities/`, `concepts/`, `sources/`, `raw/`, and `.last-sync.json`.
+
+Why commit `.last-sync.json`: it stores the git HEAD the wiki was last synced against. When a teammate pulls and runs pi, the keeper compares their HEAD to the recorded one and notifies them on `session_start` if files have drifted ("Wiki may be stale: 17 file(s) changed since last sync. Run `/wiki:sync`."). Without it, every teammate would see drift against their first-ever session.
+
+## SHA-precise drift tracking
+
+Every wiki page about a specific source file carries frontmatter:
+
+```yaml
+---
+source-file: src/payment.ts
+source-sha: a3f9c1b…         # git blob sha, auto-stamped
+source-mtime: 1738209200      # auto-stamped
+last-synced: 2026-04-30       # auto-stamped
+---
+```
+
+The keeper auto-stamps `source-sha`/`source-mtime`/`last-synced` after every cycle by walking all source-tracked pages and recomputing `git hash-object` on the referenced file. Drift detection unions three signals:
+
+1. **Git diff**: `git diff --name-only -M <last_head>..HEAD` + `git status --porcelain`.
+2. **Per-page SHA mismatch**: walk every page with `source-file`, compare stored `source-sha` to current. Works even outside git.
+3. **Source-missing**: file referenced in frontmatter no longer exists on disk → page flagged `source-status: missing`, surfaced in lint.
+
+## What `/wiki:sync` does
+
+Different from `/wiki:flush` (which translates *conversation*). `/wiki:sync` translates *files*:
+
+1. Acquire wiki lock + snapshot.
+2. Detect drift → list of changed source paths.
+3. Read current file contents (truncated at ~8KB each).
+4. qmd-fetch wiki pages that mention those paths.
+5. One LLM call: "here are the pre-existing wiki claims, here is the files' current state — produce JSON ops." Translation marks updates with `> [!updated]`, renames with `> [!renamed]`, removals with `> [!removed]`.
+6. Apply ops; restamp every touched page's source-sha; lint; qmd reindex; update `.last-sync.json`.
+
+Capped at 30 targets per run. Use explicit paths to override.
 
 ## Multi-session safety (5 agents on one codebase)
 
