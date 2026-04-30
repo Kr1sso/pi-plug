@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 export interface WikiKeeperSettings {
 	/** Trigger ratio in [0..1] of context fill that fires the wiki cycle. */
@@ -8,7 +9,7 @@ export interface WikiKeeperSettings {
 	wikiDir: string;
 	/** Subdir for raw, immutable sources. */
 	rawSubdir: string;
-	/** qmd collection name. */
+	/** qmd collection name. Empty (default) auto-derives a project-unique name. */
 	qmdCollection: string;
 	/** Whether the auto-trigger replaces context after wiki update. If false, only notifies and the user must run /wiki:rotate manually. */
 	autoCompactOnTrigger: boolean;
@@ -36,7 +37,7 @@ export const DEFAULT_SETTINGS: WikiKeeperSettings = {
 	triggerFillRatio: 0.5,
 	wikiDir: "wiki",
 	rawSubdir: "raw",
-	qmdCollection: "project-wiki",
+	qmdCollection: "",
 	autoCompactOnTrigger: true,
 	lint: true,
 	autoScaffold: true,
@@ -67,6 +68,23 @@ export function loadSettings(cwd: string): WikiKeeperSettings {
 	const global = readJsonSafe(join(home, ".pi", "agent", "settings.json"))?.wikiKeeper ?? {};
 	const project = readJsonSafe(join(cwd, ".pi", "settings.json"))?.wikiKeeper ?? {};
 	return { ...DEFAULT_SETTINGS, ...global, ...project };
+}
+
+/**
+ * Resolve the effective qmd collection name. Auto-derives a project-unique name
+ * when the setting is empty so that multiple projects don't share one global qmd index.
+ */
+export function resolveCollectionName(settings: WikiKeeperSettings, cwd: string): string {
+	if (settings.qmdCollection && settings.qmdCollection.trim().length > 0) {
+		return settings.qmdCollection.trim();
+	}
+	const safeBase = basename(cwd)
+		.toLowerCase()
+		.replace(/[^a-z0-9-]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 32) || "project";
+	const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 8);
+	return `${safeBase}-${hash}-wiki`;
 }
 
 export interface WikiPaths {

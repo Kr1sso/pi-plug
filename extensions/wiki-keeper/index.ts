@@ -11,9 +11,11 @@ import {
 	type SessionEntry,
 } from "@mariozechner/pi-coding-agent";
 
-import { loadSettings, resolveWikiPaths, type WikiKeeperSettings } from "./lib/settings.js";
+import { loadSettings, resolveCollectionName, resolveWikiPaths, type WikiKeeperSettings } from "./lib/settings.js";
 import {
 	applyOps,
+	archiveLog,
+	countLogEntries,
 	ensureWikiTree,
 	formatLintReport,
 	lintWiki,
@@ -21,7 +23,7 @@ import {
 	readFileIfExists,
 	type WikiOp,
 } from "./lib/wiki-fs.js";
-import { qmdAvailable, qmdEmbed, qmdEnsureCollection, qmdQuery, qmdStatus } from "./lib/qmd.js";
+import { qmdAvailable, qmdCollectionIsEmpty, qmdEmbed, qmdEnsureCollection, qmdQuery, qmdStatus } from "./lib/qmd.js";
 import { callModelText, extractJson, resolveTranslationModel } from "./lib/translate.js";
 import { peekProject, renderPeek } from "./lib/scaffold.js";
 import { acquireWikiLock, listSnapshots, restoreLatestSnapshot, snapshotWiki } from "./lib/lock.js";
@@ -42,6 +44,18 @@ const WIKI_GITIGNORE = `# pi-plug wiki transient state
 .snapshots/
 lint-report.md
 `;
+
+const WIKI_GITATTRIBUTES = `# pi-plug wiki merge driver hints
+log.md merge=union
+log-archive-*.md merge=union
+`;
+
+const SCAFFOLD_QUALITY_FILE = ".scaffold-quality";
+interface ScaffoldQuality {
+	quality: "default" | "llm";
+	at: number;
+	model?: string;
+}
 
 /** Cap the synthesized post-rotation summary so it doesn't bleed tokens into the next session. */
 const MAX_ROTATION_SUMMARY_CHARS = 600;
@@ -81,6 +95,24 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			return `pid-${process.pid}`;
 		}
+	};
+
+	const getCollection = () => resolveCollectionName(state.settings, process.cwd());
+
+	const readScaffoldQuality = (paths: ReturnType<typeof resolveWikiPaths>): ScaffoldQuality | undefined => {
+		const raw = readFileIfExists(join(paths.root, SCAFFOLD_QUALITY_FILE));
+		if (!raw) return undefined;
+		try {
+			return JSON.parse(raw) as ScaffoldQuality;
+		} catch {
+			return undefined;
+		}
+	};
+
+	const writeScaffoldQuality = (paths: ReturnType<typeof resolveWikiPaths>, quality: ScaffoldQuality) => {
+		try {
+			writeFileSync(join(paths.root, SCAFFOLD_QUALITY_FILE), JSON.stringify(quality, null, 2) + "\n");
+		} catch {}
 	};
 
 	// ─── helpers ──────────────────────────────────────────────────────
@@ -163,15 +195,19 @@ export default function (pi: ExtensionAPI) {
 		// Ensure wiki/.gitignore so users committing wiki/ don't accidentally commit transient state.
 		const gi = join(paths.root, ".gitignore");
 		if (!existsSync(gi)) {
-			try {
-				writeFileSync(gi, WIKI_GITIGNORE);
-			} catch {}
+			try { writeFileSync(gi, WIKI_GITIGNORE); } catch {}
 		}
-		// qmd availability is best-effort — warn once
+		// Ensure wiki/.gitattributes so log.md merges cleanly across branches.
+		const ga = join(paths.root, ".gitattributes");
+		if (!existsSync(ga)) {
+			try { writeFileSync(ga, WIKI_GITATTRIBUTES); } catch {}
+		}
+		// qmd availability is best-effort — warn once per process via state.
+		const collection = resolveCollectionName(state.settings, process.cwd());
 		if (!(await qmdAvailable())) {
 			notify(ctx, "qmd not found on PATH. Run: npm install -g @tobilu/qmd (or pi-plug install.sh)", "warning");
 		} else {
-			await qmdEnsureCollection(state.settings.qmdCollection, paths.root);
+			await qmdEnsureCollection(collection, paths.root);
 		}
 		return paths;
 	};
@@ -182,77 +218,69 @@ export default function (pi: ExtensionAPI) {
 
 	// ─── scaffold ─────────────────────────────────────────────────────
 
-	const scaffoldWiki = async (ctx: ExtensionContext) => {
+	const scaffoldWiki = async (ctx: ExtensionContext, force = false) => {
 		const paths = await ensureSetup(ctx);
-		if (isWikiBootstrapped(paths)) return { paths, scaffolded: false };
+		if (!force && isWikiBootstrapped(paths)) return { paths, scaffolded: false };
+
+		const sessionId = sessionIdOf(ctx);
+		const lock = await acquireWikiLock(join(paths.root, ".lock"), sessionId, { timeoutMs: LOCK_TIMEOUT_MS });
+		if (!lock) {
+			if (isWikiBootstrapped(paths)) return { paths, scaffolded: false };
+			notify(ctx, "wiki: another session holds the lock during scaffold; try again shortly.", "warning");
+			return { paths, scaffolded: false };
+		}
 
 		startIndicator(ctx, "scaffold", "peeking project");
 		try {
-		const peek = peekProject(process.cwd());
-		const peekText = renderPeek(peek);
+			if (!force && isWikiBootstrapped(paths)) return { paths, scaffolded: false };
 
-		const resolved = resolveTranslationModel(ctx, state.settings);
-		if (!resolved.model) {
-			// Minimal fallback scaffold without LLM.
-			const fallbackOps: WikiOp[] = [
-				{
-					op: "overwrite",
-					path: "schema.md",
-					content: defaultSchema(),
-				},
-				{ op: "overwrite", path: "index.md", content: defaultIndex() },
-				{ op: "overwrite", path: "log.md", content: defaultLog() },
-			];
-			applyOps(paths, fallbackOps);
-			notify(ctx, `Scaffolded wiki (no model — used defaults). ${resolved.error}`, "warning");
-			stopIndicator(ctx);
-			return { paths, scaffolded: true };
-		}
+			const peek = peekProject(process.cwd());
+			const peekText = renderPeek(peek);
 
-		updatePhase(ctx, "calling scaffold model");
-		const result = await callModelText(
-			ctx,
-			resolved.model,
-			PROMPT_SCAFFOLD,
-			peekText,
-			ctx.signal,
-			6000,
-		);
-		if (!result.ok) {
-			notify(ctx, `Wiki scaffold model call failed: ${result.error}. Using defaults.`, "warning");
+			const writeDefaults = () => {
+				applyOps(paths, [
+					{ op: "overwrite", path: "schema.md", content: defaultSchema() },
+					{ op: "overwrite", path: "index.md", content: defaultIndex() },
+					{ op: "overwrite", path: "log.md", content: defaultLog() },
+				]);
+				writeScaffoldQuality(paths, { quality: "default", at: Date.now() });
+			};
+
+			const resolved = resolveTranslationModel(ctx, state.settings);
+			if (!resolved.model) {
+				writeDefaults();
+				notify(ctx, `Scaffolded wiki (no model — used defaults). ${resolved.error}`, "warning");
+				return { paths, scaffolded: true };
+			}
+
+			updatePhase(ctx, "calling scaffold model");
+			const result = await callModelText(ctx, resolved.model, PROMPT_SCAFFOLD, peekText, ctx.signal, 6000);
+			if (!result.ok) {
+				writeDefaults();
+				notify(ctx, `Wiki scaffold model call failed: ${result.error}. Using defaults.`, "warning");
+				return { paths, scaffolded: true };
+			}
+			updatePhase(ctx, "applying scaffold ops");
+			const parsed = extractJson(result.text) as { ops?: WikiOp[] } | undefined;
+			const ops = (parsed?.ops ?? []) as WikiOp[];
+			if (ops.length === 0) {
+				writeDefaults();
+			} else {
+				applyOps(paths, ops);
+				writeScaffoldQuality(paths, { quality: "llm", at: Date.now(), model: `${resolved.model.provider}/${resolved.model.id}` });
+			}
 			applyOps(paths, [
-				{ op: "overwrite", path: "schema.md", content: defaultSchema() },
-				{ op: "overwrite", path: "index.md", content: defaultIndex() },
-				{ op: "overwrite", path: "log.md", content: defaultLog() },
+				{ op: "log", entry: `## [${nowStamp()}] scaffold | ${sessionId} | initial wiki bootstrap${ops.length === 0 ? " (defaults)" : ""}` },
 			]);
-			stopIndicator(ctx);
-			return { paths, scaffolded: true };
-		}
-		updatePhase(ctx, "applying scaffold ops");
-		const parsed = extractJson(result.text) as { ops?: WikiOp[] } | undefined;
-		const ops = (parsed?.ops ?? []) as WikiOp[];
-		if (ops.length === 0) {
-			applyOps(paths, [
-				{ op: "overwrite", path: "schema.md", content: defaultSchema() },
-				{ op: "overwrite", path: "index.md", content: defaultIndex() },
-				{ op: "overwrite", path: "log.md", content: defaultLog() },
-			]);
-		} else {
-			applyOps(paths, ops);
-		}
-		applyOps(paths, [
-			{ op: "log", entry: `## [${nowStamp()}] scaffold | initial wiki bootstrap` },
-		]);
 
-		// reindex
-		updatePhase(ctx, "qmd reindex");
-		try {
-			await qmdEmbed(state.settings.qmdCollection, process.cwd());
-		} catch {}
-		notify(ctx, `Wiki scaffolded at ${relative(process.cwd(), paths.root) || paths.root}.`, "info");
-		stopIndicator(ctx);
-		return { paths, scaffolded: true };
+			updatePhase(ctx, "qmd reindex");
+			try {
+				await qmdEmbed(getCollection(), process.cwd());
+			} catch {}
+			notify(ctx, `Wiki scaffolded at ${relative(process.cwd(), paths.root) || paths.root}.`, "info");
+			return { paths, scaffolded: true };
 		} finally {
+			lock.release();
 			stopIndicator(ctx);
 		}
 	};
@@ -296,7 +324,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		updatePhase(ctx, "snapshot");
 		try {
-			snapshotWiki(paths.root); // pre-cycle snapshot for /wiki:undo
+			snapshotWiki(paths.root, state.settings.keepSnapshots); // pre-cycle snapshot for /wiki:undo
 
 			// Phase A — snapshot
 			let transcript = args.preparedTranscript;
@@ -324,10 +352,10 @@ export default function (pi: ExtensionAPI) {
 			// Pre-fetch related pages via qmd, grounded by LLM-extracted keyphrases (better hits than raw tail).
 			let relatedPages = "";
 			try {
-				const keyphrases = await extractKeyphrases(ctx, resolved.model, transcript);
+				const keyphrases = await extractKeyphrases(ctx, resolved.model, transcript, paths.root);
 				const hitMap = new Map<string, { path: string; score: number; snippet?: string }>();
 				for (const phrase of keyphrases) {
-					const hits = await qmdQuery(phrase, state.settings.qmdCollection, 4);
+					const hits = await qmdQuery(phrase, getCollection(), 4);
 					for (const h of hits) {
 						const p = (h.path as string) || "";
 						if (!p) continue;
@@ -402,7 +430,7 @@ export default function (pi: ExtensionAPI) {
 
 			updatePhase(ctx, "qmd reindex");
 			try {
-				await qmdEmbed(state.settings.qmdCollection, process.cwd());
+				await qmdEmbed(getCollection(), process.cwd());
 			} catch (err) {
 				notify(ctx, `qmd embed failed: ${err instanceof Error ? err.message : String(err)}`, "warning");
 			}
@@ -425,6 +453,7 @@ export default function (pi: ExtensionAPI) {
 		} finally {
 			lock.release();
 			state.cycleInProgress = false;
+			state.lastCycleAt = Date.now(); // C7: stamp on every cycle outcome (success OR failure) to gate cooldown
 			stopIndicator(ctx);
 		}
 	};
@@ -433,9 +462,15 @@ export default function (pi: ExtensionAPI) {
 		ctx: ExtensionContext,
 		model: NonNullable<ExtensionContext["model"]>,
 		transcript: string,
+		wikiRoot: string,
 	): Promise<string[]> => {
+		// R5: skip the LLM call entirely when the wiki is too sparse for useful pre-fetch grounding.
+		const pageCount = listMarkdownFiles(wikiRoot).length;
+		if (pageCount < state.settings.prefetchMinPages) return [];
 		const tail = transcript.slice(-6000);
-		const result = await callModelText(ctx, model, "", PROMPT_KEYPHRASES + tail, ctx.signal, 400);
+		// Pass the prompt as the system prompt rather than concatenating into the user message;
+		// avoids passing an empty system prompt (which some providers handle oddly).
+		const result = await callModelText(ctx, model, PROMPT_KEYPHRASES.trim(), tail, ctx.signal, 400);
 		if (!result.ok) return [];
 		const parsed = extractJson(result.text);
 		if (Array.isArray(parsed)) return (parsed as unknown[]).filter((s): s is string => typeof s === "string" && s.length > 0).slice(0, 5);
@@ -462,10 +497,19 @@ export default function (pi: ExtensionAPI) {
 		}
 		try {
 			updatePhase(ctx, "detecting drift");
-			const drift = detectDrift(paths, process.cwd());
+			const drift = detectDrift(paths, process.cwd(), state.settings.wikiDir);
 			let targets = explicitTargets && explicitTargets.length > 0
 				? [...new Set(explicitTargets)].sort()
-				: suggestSyncTargets(drift, process.cwd());
+				: suggestSyncTargets(drift, process.cwd(), state.settings.wikiDir);
+			if (drift.mode === "branch-switch" && (!explicitTargets || explicitTargets.length === 0)) {
+				notify(
+					ctx,
+					`wiki sync: branch switched (${drift.sinceBranch} → ${drift.currentBranch}); refusing to auto-detect cross-branch targets. Pass explicit paths.`,
+					"warning",
+				);
+				writeLastSync(paths, process.cwd(), 0);
+				return { ok: true, summary: "branch switched; auto-target detection skipped", targets: 0, opsApplied: 0 };
+			}
 			// Cap to avoid runaway syncs on huge merges.
 			const MAX_TARGETS = 30;
 			let capped = false;
@@ -507,7 +551,7 @@ export default function (pi: ExtensionAPI) {
 			// Pre-fetch related wiki pages keyed off the file paths themselves.
 			const hitMap = new Map<string, string>();
 			for (const rel of targets.slice(0, 10)) {
-				const hits = await qmdQuery(rel, state.settings.qmdCollection, 3);
+				const hits = await qmdQuery(rel, getCollection(), 3);
 				for (const h of hits) {
 					const p = (h.path as string) || "";
 					if (!p || hitMap.has(p)) continue;
@@ -549,7 +593,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			updatePhase(ctx, `applying ${ops.length} ops`);
-			snapshotWiki(paths.root);
+			snapshotWiki(paths.root, state.settings.keepSnapshots);
 			const report = applyOps(paths, ops);
 
 			if (state.settings.lint) {
@@ -562,7 +606,7 @@ export default function (pi: ExtensionAPI) {
 			restampAllSourceTrackedPages(paths);
 			writeLastSync(paths, process.cwd(), targets.length);
 			try {
-				await qmdEmbed(state.settings.qmdCollection, process.cwd());
+				await qmdEmbed(getCollection(), process.cwd());
 			} catch {}
 
 			return {
@@ -574,6 +618,7 @@ export default function (pi: ExtensionAPI) {
 		} finally {
 			lock.release();
 			state.cycleInProgress = false;
+			state.lastCycleAt = Date.now();
 			stopIndicator(ctx);
 		}
 	};
@@ -682,7 +727,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			updatePhase(ctx, `applying ${ops.length} ops`);
-			snapshotWiki(paths.root);
+			snapshotWiki(paths.root, state.settings.keepSnapshots);
 			applyOps(paths, ops);
 
 			updatePhase(ctx, "re-linting");
@@ -693,7 +738,7 @@ export default function (pi: ExtensionAPI) {
 			restampAllSourceTrackedPages(paths);
 			writeLastSync(paths, process.cwd());
 			try {
-				await qmdEmbed(state.settings.qmdCollection, process.cwd());
+				await qmdEmbed(getCollection(), process.cwd());
 			} catch {}
 
 			return {
@@ -706,6 +751,7 @@ export default function (pi: ExtensionAPI) {
 		} finally {
 			lock.release();
 			state.cycleInProgress = false;
+			state.lastCycleAt = Date.now();
 			stopIndicator(ctx);
 		}
 	};
@@ -748,7 +794,7 @@ export default function (pi: ExtensionAPI) {
 		const tail = log.split("\n").filter((l) => l.startsWith("## [")).slice(-3).join("\n") || "(no prior wiki entries)";
 		return PROMPT_SEED
 			.replace(/\{\{WIKI_DIR\}\}/g, state.settings.wikiDir)
-			.replace(/\{\{QMD_COLLECTION\}\}/g, state.settings.qmdCollection)
+			.replace(/\{\{QMD_COLLECTION\}\}/g, getCollection())
 			.replace(/\{\{LAST_LOG_TAIL\}\}/g, tail)
 			.replace(/\{\{NEXT_TASK\}\}/g, nextTask || "(continue from where we left off — query the wiki to orient yourself)");
 	};
@@ -765,21 +811,74 @@ export default function (pi: ExtensionAPI) {
 				notify(ctx, `wiki scaffold failed: ${err instanceof Error ? err.message : String(err)}`, "error"),
 			);
 		} else if (isWikiBootstrapped(paths)) {
+			// C3: if we previously scaffolded with defaults (no model was available) AND a model is
+			// available now AND the wiki has had no real activity yet (only the scaffold log entry),
+			// re-scaffold with the LLM in the background.
+			try {
+				const quality = readScaffoldQuality(paths);
+				const logEntries = countLogEntries(paths.logMd);
+				if (
+					quality?.quality === "default" &&
+					logEntries <= 1 &&
+					resolveTranslationModel(ctx, state.settings).model
+				) {
+					notify(ctx, "wiki: re-scaffolding with LLM (previous bootstrap used defaults).", "info");
+					scaffoldWiki(ctx, true).catch((err) =>
+						notify(ctx, `wiki re-scaffold failed: ${err instanceof Error ? err.message : String(err)}`, "error"),
+					);
+				}
+			} catch {}
+
+			// C5: if qmd index is empty for this collection but the wiki has content, embed.
+			if (state.settings.qmdAutoEmbedOnStart) {
+				(async () => {
+					try {
+						if (!(await qmdAvailable())) return;
+						const empty = await qmdCollectionIsEmpty(getCollection());
+						if (empty && listMarkdownFiles(paths.root).length > 0) {
+							notify(ctx, "wiki: qmd index empty for this collection — embedding now (one-time cost).", "info");
+							await qmdEmbed(getCollection(), process.cwd());
+						}
+					} catch {}
+				})();
+			}
+
 			// Drift notification (cheap; never auto-syncs).
 			try {
-				const drift = detectDrift(paths, process.cwd());
-				const total = drift.changedFiles.length + drift.staleWikiPages.length;
-				if (total >= 3) {
-					const bits: string[] = [];
-					if (drift.changedFiles.length) bits.push(`${drift.changedFiles.length} file(s) changed since last sync`);
-					if (drift.staleWikiPages.length) bits.push(`${drift.staleWikiPages.length} wiki page(s) drifted`);
-					notify(ctx, `Wiki may be stale: ${bits.join(", ")}. Run /wiki:sync (or /wiki:status for detail).`, "warning");
+				const drift = detectDrift(paths, process.cwd(), state.settings.wikiDir);
+				if (drift.mode === "branch-switch") {
+					notify(
+						ctx,
+						`Wiki: branch switched (${drift.sinceBranch} → ${drift.currentBranch}); wiki may not match current branch. Use /wiki:sync <paths> for targeted updates.`,
+						"warning",
+					);
+				} else {
+					const total = drift.changedFiles.length + drift.staleWikiPages.length;
+					if (total >= 3) {
+						const bits: string[] = [];
+						if (drift.changedFiles.length) bits.push(`${drift.changedFiles.length} file(s) changed since last sync`);
+						if (drift.staleWikiPages.length) bits.push(`${drift.staleWikiPages.length} wiki page(s) drifted`);
+						notify(ctx, `Wiki may be stale: ${bits.join(", ")}. Run /wiki:sync (or /wiki:status for detail).`, "warning");
+					}
+				}
+			} catch {}
+
+			// Log archive suggestion.
+			try {
+				const entries = countLogEntries(paths.logMd);
+				if (entries > state.settings.logArchiveSuggestEntries) {
+					notify(
+						ctx,
+						`Wiki log has ${entries} entries (>${state.settings.logArchiveSuggestEntries}). Run /wiki:archive to roll older entries into log-archive-YYYY-MM.md.`,
+						"info",
+					);
 				}
 			} catch {}
 		}
 	});
 
 	pi.on("turn_end", (_event, ctx) => {
+		refreshSettings(); // hot-reload settings each turn check
 		if (state.cycleInProgress) return;
 		const ratio = computeFillRatio(ctx);
 		if (ratio === null) return;
@@ -789,6 +888,14 @@ export default function (pi: ExtensionAPI) {
 		if (ratio < state.settings.triggerFillRatio) return;
 		if (Date.now() - state.lastCycleAt < state.settings.cooldownMs) return;
 		state.armed = false;
+		if (!state.settings.autoCompactOnTrigger) {
+			notify(
+				ctx,
+				`Context at ${(ratio * 100).toFixed(0)}% — wiki rotation suggested. Run /wiki:rotate (autoCompactOnTrigger=false).`,
+				"warning",
+			);
+			return;
+		}
 		notify(
 			ctx,
 			`Context at ${(ratio * 100).toFixed(0)}% — triggering wiki rotation (threshold ${(state.settings.triggerFillRatio * 100).toFixed(0)}%).`,
@@ -798,6 +905,7 @@ export default function (pi: ExtensionAPI) {
 		ctx.compact({
 			customInstructions: "WIKI_KEEPER_ROTATE",
 			onError: (err) => {
+				state.armed = true; // re-arm so we can retry
 				notify(ctx, `wiki rotation compaction failed: ${err.message}`, "error");
 			},
 		});
@@ -805,14 +913,21 @@ export default function (pi: ExtensionAPI) {
 
 	// Replace pi's default compaction with our wiki cycle ONLY when we explicitly triggered it.
 	// Manual /compact (or any other extension's compaction) flows through unmodified.
+	// On failure, return { cancel: true } so the user's context is NOT swapped — they keep their
+	// conversation and the next turn_end can re-attempt (we re-arm armed=true here too).
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (event.customInstructions !== "WIKI_KEEPER_ROTATE") return;
 		const { preparation } = event;
 		const all = [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
 		const transcript = serializeConversation(convertToLlm(all));
 		const result = await runWikiCycle({ ctx, preparedTranscript: transcript, reason: "auto" });
+		if (!result.ok) {
+			state.armed = true;
+			notify(ctx, `Wiki rotation skipped: ${result.error ?? "unknown error"}. Context preserved; will retry.`, "warning");
+			return { cancel: true };
+		}
 		const seed = buildSeed(ctx, "");
-		const rawSummary = result.ok ? result.summary : `(wiki update failed: ${result.error})`;
+		const rawSummary = result.summary;
 		const capped =
 			rawSummary.length > MAX_ROTATION_SUMMARY_CHARS
 				? rawSummary.slice(0, MAX_ROTATION_SUMMARY_CHARS - 1).trimEnd() + "…"
@@ -837,7 +952,7 @@ export default function (pi: ExtensionAPI) {
 		const hasIngest = /^## \[[^\]]+\] (ingest|manual-flush|manual-rotate|auto)/m.test(log);
 		if (!hasIngest) return;
 		state.disciplineNudgeApplied = true;
-		const addendum = `\n\n## Wiki discipline (pi-plug)\n\nThis project has a knowledge wiki at \`./${state.settings.wikiDir}/\` (qmd collection: \`${state.settings.qmdCollection}\`).\nBefore reading any project source file, call the \`wiki_query\` tool. Only fall back to direct \`read\` when the wiki has no relevant hit.\nThe wiki is the authoritative, accumulated knowledge — your prior sessions have already condensed findings there.`;
+		const addendum = `\n\n## Wiki discipline (pi-plug)\n\nThis project has a knowledge wiki at \`./${state.settings.wikiDir}/\` (qmd collection: \`${getCollection()}\`).\nBefore reading any project source file, call the \`wiki_query\` tool. Only fall back to direct \`read\` when the wiki has no relevant hit.\nThe wiki is the authoritative, accumulated knowledge — your prior sessions have already condensed findings there.`;
 		return { systemPrompt: event.systemPrompt + addendum };
 	});
 
@@ -856,7 +971,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params) {
 			const top = typeof params.topK === "number" ? params.topK : 5;
-			const hits = await qmdQuery(params.query, state.settings.qmdCollection, top);
+			const hits = await qmdQuery(params.query, getCollection(), top);
 			if (!hits.length) {
 				return {
 					content: [
@@ -974,7 +1089,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				updatePhase(ctx, "qmd reindex");
 				try {
-					await qmdEmbed(state.settings.qmdCollection, process.cwd());
+					await qmdEmbed(getCollection(), process.cwd());
 				} catch {}
 				notify(ctx, `wiki: restored snapshot ${restored.stamp}. ${snapshots.length - 1} snapshot(s) remain.`, "info");
 			} finally {
@@ -995,35 +1110,85 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("wiki:archive", {
+		description: "Roll older log.md entries into log-archive-YYYY-MM.md files. Default keeps the most recent 100 entries; pass an integer to override (e.g. /wiki:archive 30).",
+		handler: async (args, ctx) => {
+			refreshSettings();
+			const keep = (() => {
+				const n = parseInt(args.trim(), 10);
+				return Number.isFinite(n) && n > 0 ? n : 100;
+			})();
+			const paths = await ensureSetup(ctx);
+			const lock = await acquireWikiLock(join(paths.root, ".lock"), sessionIdOf(ctx), { timeoutMs: LOCK_TIMEOUT_MS });
+			if (!lock) {
+				notify(ctx, "wiki: another session holds the lock; try again shortly.", "warning");
+				return;
+			}
+			try {
+				snapshotWiki(paths.root, state.settings.keepSnapshots);
+				const result = archiveLog(paths.logMd, keep);
+				if (result.archivedEntries === 0) {
+					notify(ctx, `wiki archive: nothing to archive (log has ${result.keptEntries} entries, threshold ${keep}).`, "info");
+					return;
+				}
+				// Append a meta log entry recording the archive operation.
+				applyOps(paths, [
+					{
+						op: "log",
+						entry: `## [${nowStamp()}] archive | ${sessionIdOf(ctx)} | rolled ${result.archivedEntries} entries into ${result.archiveFiles.length} archive file(s); kept ${result.keptEntries}`,
+					},
+				]);
+				try {
+					await qmdEmbed(getCollection(), process.cwd());
+				} catch {}
+				notify(
+					ctx,
+					`wiki archive: rolled ${result.archivedEntries} entries into ${result.archiveFiles.length} file(s) (${result.archiveFiles.map((f) => f.split("/").pop()).join(", ")}); kept ${result.keptEntries}.`,
+					"info",
+				);
+			} finally {
+				lock.release();
+			}
+		},
+	});
+
 	pi.registerCommand("wiki:status", {
 		description: "Show wiki + qmd status.",
 		handler: async (_args, ctx) => {
 			const paths = resolveWikiPaths(process.cwd(), state.settings);
 			const ratio = computeFillRatio(ctx);
 			const qmdHas = await qmdAvailable();
-			const qmdSt = qmdHas ? await qmdStatus(state.settings.qmdCollection) : null;
+			const qmdSt = qmdHas ? await qmdStatus(getCollection()) : null;
 			const snapshots = listSnapshots(paths.root);
 			const lockMeta = readFileIfExists(join(paths.root, ".lock"));
 			const gitOn = isGitRepo(process.cwd());
+			const quality = readScaffoldQuality(paths);
+			const logEntries = countLogEntries(paths.logMd);
 			let driftLine = "drift:           (skipped)";
 			if (isWikiBootstrapped(paths)) {
 				try {
-					const d = detectDrift(paths, process.cwd());
-					driftLine = `drift:           ${d.changedFiles.length} file(s) changed${d.staleWikiPages.length ? `, ${d.staleWikiPages.length} wiki page(s) drifted` : ""} (mode: ${d.mode})`;
+					const d = detectDrift(paths, process.cwd(), state.settings.wikiDir);
+					if (d.mode === "branch-switch") {
+						driftLine = `drift:           branch switched (${d.sinceBranch} → ${d.currentBranch}); cross-branch diff suppressed`;
+					} else {
+						driftLine = `drift:           ${d.changedFiles.length} file(s) changed${d.staleWikiPages.length ? `, ${d.staleWikiPages.length} wiki page(s) drifted` : ""} (mode: ${d.mode})`;
+					}
 				} catch {}
 			}
 			const lines = [
 				`wiki dir:        ${relative(process.cwd(), paths.root) || paths.root}`,
-				`bootstrapped:    ${isWikiBootstrapped(paths) ? "yes" : "no"}`,
+				`bootstrapped:    ${isWikiBootstrapped(paths) ? "yes" : "no"}${quality ? ` (scaffold: ${quality.quality}${quality.model ? ` via ${quality.model}` : ""})` : ""}`,
 				`session id:      ${sessionIdOf(ctx)}`,
 				`lock:            ${lockMeta ? lockMeta.replace(/\s+/g, " ").slice(0, 120) : "free"}`,
-				`snapshots:       ${snapshots.length} (latest: ${snapshots[0]?.stamp ?? "none"})`,
+				`snapshots:       ${snapshots.length} (keep ${state.settings.keepSnapshots}; latest: ${snapshots[0]?.stamp ?? "none"})`,
+				`log entries:     ${logEntries}${logEntries > state.settings.logArchiveSuggestEntries ? " — consider /wiki:archive" : ""}`,
 				`git repo:        ${gitOn ? "yes" : "no (using mtime fallback)"}`,
 				driftLine,
 				`context fill:    ${ratio === null ? "unknown" : (ratio * 100).toFixed(1) + "%"} (trigger ${(state.settings.triggerFillRatio * 100).toFixed(0)}%)`,
 				`armed:           ${state.armed ? "yes" : "no (will re-arm under " + Math.round(state.settings.triggerFillRatio * 80) + "%)"}`,
+				`auto-rotate:     ${state.settings.autoCompactOnTrigger ? "on" : "off (manual /wiki:rotate only)"}`,
 				`qmd installed:   ${qmdHas ? "yes" : "no — install with: npm i -g @tobilu/qmd"}`,
-				`qmd collection:  ${state.settings.qmdCollection}`,
+				`qmd collection:  ${getCollection()}`,
 				`translation:     ${state.settings.translationModelId && state.settings.translationModelProvider ? `${state.settings.translationModelProvider}/${state.settings.translationModelId}` : ctx.model ? `${ctx.model.provider}/${ctx.model.id} (current)` : "(no model)"}`,
 				`lint enabled:    ${state.settings.lint}`,
 				`auto-scaffold:   ${state.settings.autoScaffold}`,
@@ -1067,7 +1232,7 @@ export default function (pi: ExtensionAPI) {
 				notify(ctx, `usage: /wiki:query <query>`, "warning");
 				return;
 			}
-			const hits = await qmdQuery(q, state.settings.qmdCollection, 8);
+			const hits = await qmdQuery(q, getCollection(), 8);
 			if (!hits.length) {
 				notify(ctx, `no hits for "${q}".`, "info");
 				return;

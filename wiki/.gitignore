@@ -1,0 +1,4 @@
+# pi-plug wiki transient state
+.lock
+.snapshots/
+lint-report.md

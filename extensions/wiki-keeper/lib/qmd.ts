@@ -81,3 +81,21 @@ export async function qmdStatus(collection?: string): Promise<QmdResult> {
 	if (collection) args.push("-c", collection);
 	return run("qmd", args, { timeoutMs: 15_000 });
 }
+
+/**
+ * Best-effort check: does the collection's qmd index appear empty?
+ * Parses `qmd status -c <coll>` looking for a doc count. Returns true ONLY when
+ * we can confidently parse a 0-doc result; returns false when unparseable so we
+ * don't kick off a needless embed.
+ */
+export async function qmdCollectionIsEmpty(collection: string): Promise<boolean> {
+	const r = await qmdStatus(collection);
+	if (!r.ok) return false;
+	const text = (r.stdout + "\n" + r.stderr).toLowerCase();
+	// Look for explicit zero indicators across plausible qmd output formats.
+	if (/\b0\s+document(s)?\b/.test(text)) return true;
+	if (/\bdocuments?\s*[:=]\s*0\b/.test(text)) return true;
+	if (/\bno\s+documents?\b/.test(text)) return true;
+	if (/\bcollection\s+empty\b/.test(text)) return true;
+	return false;
+}

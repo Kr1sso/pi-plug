@@ -55,24 +55,27 @@ export function gitBranch(cwd: string): string | undefined {
 	return b && b !== "HEAD" ? b : undefined;
 }
 
-export function gitChangedSince(cwd: string, sinceSha: string): string[] {
+export function gitChangedSince(cwd: string, sinceSha: string, excludePrefix?: string): string[] {
 	// Diff (committed) since sinceSha + uncommitted changes.
 	const committed = spawnSync("git", ["diff", "--name-only", "-M", `${sinceSha}..HEAD`], { cwd, encoding: "utf8" });
 	const dirty = spawnSync("git", ["status", "--porcelain"], { cwd, encoding: "utf8" });
 	const set = new Set<string>();
+	const push = (p: string) => {
+		if (!p) return;
+		if (excludePrefix && (p === excludePrefix || p.startsWith(excludePrefix + "/"))) return;
+		set.add(p);
+	};
 	if (committed.status === 0) {
-		for (const line of committed.stdout.split("\n")) {
-			const t = line.trim();
-			if (t) set.add(t);
-		}
+		for (const line of committed.stdout.split("\n")) push(line.trim());
 	}
 	if (dirty.status === 0) {
-		for (const line of dirty.stdout.split("\n")) {
-			const t = line.trim();
-			if (!t) continue;
-			// Format: "XY <path>" or "R  old -> new" — take last token after "->".
-			const path = t.includes(" -> ") ? t.split(" -> ").pop()! : t.slice(3);
-			if (path) set.add(path);
+		for (const rawLine of dirty.stdout.split("\n")) {
+			// `git status --porcelain` format: "XY <path>" where X=index, Y=worktree, plus a single space.
+			// Do NOT .trim() — a leading space in XY is meaningful (e.g. " M file" = unstaged modify) and
+			// trimming corrupts the slice offset, eating the first character of the path.
+			if (rawLine.length < 4) continue;
+			const path = rawLine.includes(" -> ") ? rawLine.split(" -> ").pop()! : rawLine.slice(3);
+			push(path);
 		}
 	}
 	return [...set].sort();
@@ -81,11 +84,12 @@ export function gitChangedSince(cwd: string, sinceSha: string): string[] {
 // ─── Drift detection ──────────────────────────────────────────────────
 
 export interface DriftReport {
-	mode: "git" | "mtime" | "none";
+	mode: "git" | "mtime" | "branch-switch" | "none";
 	sinceHead?: string;
 	currentHead?: string;
+	sinceBranch?: string;
 	currentBranch?: string;
-	changedFiles: string[]; // project-relative paths
+	changedFiles: string[]; // project-relative paths (excludes wiki dir)
 	staleWikiPages: { wikiFile: string; sourceFile: string; reason: "sha-mismatch" | "source-missing" }[];
 	totalWikiPagesWithSource: number;
 }
@@ -120,25 +124,29 @@ export function listSourceTrackingPages(paths: WikiPaths, projectCwd: string): P
 	return out;
 }
 
-export function detectDrift(paths: WikiPaths, projectCwd: string): DriftReport {
+export function detectDrift(paths: WikiPaths, projectCwd: string, wikiDirRelative?: string): DriftReport {
 	const last = readLastSync(paths);
 	const isGit = isGitRepo(projectCwd);
 	const currentHead = isGit ? gitHead(projectCwd) : undefined;
 	const currentBranch = isGit ? gitBranch(projectCwd) : undefined;
+	const sinceBranch = last?.gitBranch;
 
 	let changedFiles: string[] = [];
 	let mode: DriftReport["mode"] = "none";
 
+	const onDifferentBranch = !!(sinceBranch && currentBranch && sinceBranch !== currentBranch);
+
 	if (isGit && last?.gitHead && currentHead) {
-		mode = "git";
-		if (last.gitHead !== currentHead || true /* always include dirty */) {
-			changedFiles = gitChangedSince(projectCwd, last.gitHead);
+		if (onDifferentBranch) {
+			// Branch switched: don't try to enumerate cross-branch diffs (would be huge and confusing).
+			mode = "branch-switch";
+			changedFiles = [];
+		} else {
+			mode = "git";
+			changedFiles = gitChangedSince(projectCwd, last.gitHead, wikiDirRelative);
 		}
 	} else if (last?.timestamp) {
-		// mtime fallback (no git or no prior sync sha)
 		mode = "mtime";
-		// We do NOT walk the entire project tree here — too expensive without git.
-		// Instead, we rely on per-page source-mtime checks below.
 	}
 
 	// Per-page SHA / mtime check (works in both modes, and even with no last-sync).
@@ -159,6 +167,7 @@ export function detectDrift(paths: WikiPaths, projectCwd: string): DriftReport {
 		mode,
 		sinceHead: last?.gitHead,
 		currentHead,
+		sinceBranch,
 		currentBranch,
 		changedFiles,
 		staleWikiPages,
@@ -171,7 +180,12 @@ export function summarizeDrift(report: DriftReport, projectCwd: string, paths: W
 	const wrel = (p: string) => relative(paths.root, p) || p;
 	const lines: string[] = [];
 	lines.push(`mode:                ${report.mode}`);
-	if (report.currentBranch) lines.push(`branch:              ${report.currentBranch}`);
+	if (report.mode === "branch-switch") {
+		lines.push(`branch:              ${report.sinceBranch} → ${report.currentBranch}`);
+		lines.push(`note:                cross-branch diff suppressed; use /wiki:sync <paths> explicitly`);
+	} else if (report.currentBranch) {
+		lines.push(`branch:              ${report.currentBranch}`);
+	}
 	if (report.sinceHead && report.currentHead) {
 		const same = report.sinceHead === report.currentHead;
 		lines.push(`HEAD:                ${report.currentHead.slice(0, 8)} ${same ? "(== last sync)" : `(was ${report.sinceHead.slice(0, 8)})`}`);
@@ -194,12 +208,17 @@ export function summarizeDrift(report: DriftReport, projectCwd: string, paths: W
 	return lines.join("\n");
 }
 
-/** Convenience: union of changed source files + sources backing stale wiki pages. */
-export function suggestSyncTargets(report: DriftReport, projectCwd: string): string[] {
+/** Convenience: union of changed source files + sources backing stale wiki pages. Excludes wiki dir. */
+export function suggestSyncTargets(report: DriftReport, projectCwd: string, wikiDirRelative?: string): string[] {
 	const set = new Set<string>(report.changedFiles);
 	for (const s of report.staleWikiPages) {
 		const r = relative(projectCwd, s.sourceFile);
 		if (r && !r.startsWith("..")) set.add(r);
+	}
+	if (wikiDirRelative) {
+		for (const p of [...set]) {
+			if (p === wikiDirRelative || p.startsWith(wikiDirRelative + "/")) set.delete(p);
+		}
 	}
 	return [...set].sort();
 }
