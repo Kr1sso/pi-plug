@@ -20,6 +20,13 @@ Your output is a SINGLE JSON object, nothing else, no prose, no markdown fences:
 }
 
 Rules:
+- For pages about a specific source file (an entity page tied to a real file in the repo), include YAML frontmatter:
+  ```
+  ---
+  source-file: src/path/to/file.ts
+  ---
+  ```
+  The keeper auto-stamps `source-sha` and `source-mtime` after applying ops; you can leave those empty or omit them. The frontmatter enables drift detection on subsequent runs.
 - Decide for each new claim in the transcript:
   - **NEW** → `create` a new page (entity / concept / source) following schema.md.
   - **ALREADY PRESENT** → strengthen wording or add a bullet via `append` or `replace_section`. Do not duplicate.

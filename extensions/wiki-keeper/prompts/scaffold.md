@@ -14,7 +14,7 @@ You will receive a small project peek (top-level files, README, package.json or 
 }
 
 Requirements:
-- `schema.md` MUST describe: directory layout (entities/ concepts/ sources/ raw/), page formats (with YAML frontmatter conventions: tags, sources, last-updated), wikilink conventions (`[[Page]]`), how contradictions are flagged (`> [!contradiction]`), and the chronological log entry format `## [YYYY-MM-DD HH:MM] ingest | <id> | <one-line>`.
+- `schema.md` MUST describe: directory layout (entities/ concepts/ sources/ raw/), page formats with YAML frontmatter conventions (`tags`, `sources`, `last-updated`, AND for file-tracking pages: `source-file: src/path.ts`, `source-sha`, `source-mtime`, `last-synced`), wikilink conventions (`[[Page]]`), how contradictions are flagged (`> [!contradiction]`), how file-changes are flagged (`> [!updated]`, `> [!renamed]`, `> [!removed]`), and the chronological log entry format `## [YYYY-MM-DD HH:MM] <kind> | <session-id> | <one-line>` (kinds: ingest, scaffold, sync, lint, manual-flush, manual-rotate, auto).
 - `index.md` MUST have sections: `## Entities`, `## Concepts`, `## Sources`, each as a bullet list (initially `- _none yet_`).
 - `log.md` starts with `# Wiki Log` and the bootstrap entry.
 - The overview page should give a one-paragraph project description tailored to what you saw.

@@ -18,6 +18,7 @@ import {
 	ensureWikiTree,
 	formatLintReport,
 	lintWiki,
+	listMarkdownFiles,
 	readFileIfExists,
 	type WikiOp,
 } from "./lib/wiki-fs.js";
@@ -25,6 +26,10 @@ import { qmdAvailable, qmdEmbed, qmdEnsureCollection, qmdQuery, qmdStatus } from
 import { callModelText, extractJson, resolveTranslationModel } from "./lib/translate.js";
 import { peekProject, renderPeek } from "./lib/scaffold.js";
 import { acquireWikiLock, listSnapshots, restoreLatestSnapshot, snapshotWiki } from "./lib/lock.js";
+import { detectDrift, isGitRepo, suggestSyncTargets, summarizeDrift, writeLastSync } from "./lib/sync.js";
+import { gitBlobShaOfFile, parseDoc, serializeDoc, fileMtime } from "./lib/frontmatter.js";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -32,6 +37,13 @@ const PROMPT_INGEST = readFileSync(join(__dirname, "prompts", "ingest.md"), "utf
 const PROMPT_SCAFFOLD = readFileSync(join(__dirname, "prompts", "scaffold.md"), "utf8");
 const PROMPT_SEED = readFileSync(join(__dirname, "prompts", "seed.md"), "utf8");
 const PROMPT_KEYPHRASES = readFileSync(join(__dirname, "prompts", "keyphrases.md"), "utf8");
+const PROMPT_SYNC = readFileSync(join(__dirname, "prompts", "sync.md"), "utf8");
+
+const WIKI_GITIGNORE = `# pi-plug wiki transient state
+.lock
+.snapshots/
+lint-report.md
+`;
 
 /** Cap the synthesized post-rotation summary so it doesn't bleed tokens into the next session. */
 const MAX_ROTATION_SUMMARY_CHARS = 600;
@@ -39,6 +51,14 @@ const MAX_ROTATION_SUMMARY_CHARS = 600;
 const LOCK_TIMEOUT_MS = 45_000;
 
 const STATUS_KEY = "wiki-keeper";
+const WIDGET_KEY = "wiki-keeper";
+
+interface CycleIndicator {
+	startedAt: number;
+	phase: string;
+	kind: string; // "rotation" | "sync" | "undo" | "scaffold" | "flush" | "lint"
+	timer?: NodeJS.Timeout;
+}
 
 interface SessionState {
 	settings: WikiKeeperSettings;
@@ -74,6 +94,58 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.hasUI) ctx.ui.notify(msg, kind);
 	};
 
+	// ─── visible cycle indicator (widget + footer + ticking timer) ──────────────────────
+
+	let activeIndicator: CycleIndicator | null = null;
+
+	const renderWidget = (ind: CycleIndicator): string[] => {
+		const elapsedSec = Math.floor((Date.now() - ind.startedAt) / 1000);
+		return [
+			`● wiki ${ind.kind} in progress — do not /exit`,
+			`  phase: ${ind.phase}`,
+			`  elapsed: ${elapsedSec}s`,
+		];
+	};
+
+	const startIndicator = (ctx: ExtensionContext, kind: string, initialPhase: string) => {
+		stopIndicator(ctx); // safety: replace any prior
+		if (!ctx.hasUI) {
+			activeIndicator = { startedAt: Date.now(), phase: initialPhase, kind };
+			return;
+		}
+		activeIndicator = { startedAt: Date.now(), phase: initialPhase, kind };
+		ctx.ui.setWidget(WIDGET_KEY, renderWidget(activeIndicator), { placement: "aboveEditor" });
+		ctx.ui.setStatus(STATUS_KEY, `wiki ${kind} ▶ ${initialPhase}`);
+		activeIndicator.timer = setInterval(() => {
+			if (!activeIndicator || !ctx.hasUI) return;
+			ctx.ui.setWidget(WIDGET_KEY, renderWidget(activeIndicator), { placement: "aboveEditor" });
+			const sec = Math.floor((Date.now() - activeIndicator.startedAt) / 1000);
+			ctx.ui.setStatus(STATUS_KEY, `wiki ${activeIndicator.kind} ▶ ${activeIndicator.phase} (${sec}s)`);
+		}, 1000);
+	};
+
+	const updatePhase = (ctx: ExtensionContext, phase: string) => {
+		if (!activeIndicator) {
+			setStatus(ctx, phase);
+			return;
+		}
+		activeIndicator.phase = phase;
+		if (ctx.hasUI) {
+			ctx.ui.setWidget(WIDGET_KEY, renderWidget(activeIndicator), { placement: "aboveEditor" });
+			const sec = Math.floor((Date.now() - activeIndicator.startedAt) / 1000);
+			ctx.ui.setStatus(STATUS_KEY, `wiki ${activeIndicator.kind} ▶ ${phase} (${sec}s)`);
+		}
+	};
+
+	const stopIndicator = (ctx: ExtensionContext) => {
+		if (activeIndicator?.timer) clearInterval(activeIndicator.timer);
+		activeIndicator = null;
+		if (ctx.hasUI) {
+			ctx.ui.setWidget(WIDGET_KEY, undefined);
+			ctx.ui.setStatus(STATUS_KEY, undefined);
+		}
+	};
+
 	const refreshSettings = () => {
 		state.settings = loadSettings(process.cwd());
 	};
@@ -90,6 +162,13 @@ export default function (pi: ExtensionAPI) {
 	const ensureSetup = async (ctx: ExtensionContext) => {
 		const paths = resolveWikiPaths(process.cwd(), state.settings);
 		ensureWikiTree(paths);
+		// Ensure wiki/.gitignore so users committing wiki/ don't accidentally commit transient state.
+		const gi = join(paths.root, ".gitignore");
+		if (!existsSync(gi)) {
+			try {
+				writeFileSync(gi, WIKI_GITIGNORE);
+			} catch {}
+		}
 		// qmd availability is best-effort — warn once
 		if (!(await qmdAvailable())) {
 			notify(ctx, "qmd not found on PATH. Run: npm install -g @tobilu/qmd (or pi-plug install.sh)", "warning");
@@ -109,7 +188,8 @@ export default function (pi: ExtensionAPI) {
 		const paths = await ensureSetup(ctx);
 		if (isWikiBootstrapped(paths)) return { paths, scaffolded: false };
 
-		setStatus(ctx, "scaffolding wiki…");
+		startIndicator(ctx, "scaffold", "peeking project");
+		try {
 		const peek = peekProject(process.cwd());
 		const peekText = renderPeek(peek);
 
@@ -127,10 +207,11 @@ export default function (pi: ExtensionAPI) {
 			];
 			applyOps(paths, fallbackOps);
 			notify(ctx, `Scaffolded wiki (no model — used defaults). ${resolved.error}`, "warning");
-			setStatus(ctx, undefined);
+			stopIndicator(ctx);
 			return { paths, scaffolded: true };
 		}
 
+		updatePhase(ctx, "calling scaffold model");
 		const result = await callModelText(
 			ctx,
 			resolved.model,
@@ -146,9 +227,10 @@ export default function (pi: ExtensionAPI) {
 				{ op: "overwrite", path: "index.md", content: defaultIndex() },
 				{ op: "overwrite", path: "log.md", content: defaultLog() },
 			]);
-			setStatus(ctx, undefined);
+			stopIndicator(ctx);
 			return { paths, scaffolded: true };
 		}
+		updatePhase(ctx, "applying scaffold ops");
 		const parsed = extractJson(result.text) as { ops?: WikiOp[] } | undefined;
 		const ops = (parsed?.ops ?? []) as WikiOp[];
 		if (ops.length === 0) {
@@ -165,12 +247,16 @@ export default function (pi: ExtensionAPI) {
 		]);
 
 		// reindex
+		updatePhase(ctx, "qmd reindex");
 		try {
 			await qmdEmbed(state.settings.qmdCollection, process.cwd());
 		} catch {}
 		notify(ctx, `Wiki scaffolded at ${relative(process.cwd(), paths.root) || paths.root}.`, "info");
-		setStatus(ctx, undefined);
+		stopIndicator(ctx);
 		return { paths, scaffolded: true };
+		} finally {
+			stopIndicator(ctx);
+		}
 	};
 
 	// ─── the cycle ────────────────────────────────────────────────────
@@ -194,12 +280,15 @@ export default function (pi: ExtensionAPI) {
 		if (state.cycleInProgress) return { ok: false, summary: "", opsApplied: 0, error: "cycle already running" };
 		state.cycleInProgress = true;
 		const sessionId = sessionIdOf(ctx);
-		setStatus(ctx, "wiki: acquiring lock");
+		const kindLabel = reason === "auto" ? "rotation" : reason === "manual-rotate" ? "rotation" : "flush";
+		startIndicator(ctx, kindLabel, "acquiring lock");
 		const { paths } = await scaffoldWiki(ctx);
+		// scaffoldWiki may have stopped the indicator; re-arm.
+		if (!activeIndicator) startIndicator(ctx, kindLabel, "acquiring lock");
 		const lock = await acquireWikiLock(join(paths.root, ".lock"), sessionId, { timeoutMs: LOCK_TIMEOUT_MS });
 		if (!lock) {
 			state.cycleInProgress = false;
-			setStatus(ctx, undefined);
+			stopIndicator(ctx);
 			return {
 				ok: false,
 				summary: "",
@@ -207,7 +296,7 @@ export default function (pi: ExtensionAPI) {
 				error: `another session holds the wiki lock for >${Math.round(LOCK_TIMEOUT_MS / 1000)}s; skipping cycle (will retry on next trigger)`,
 			};
 		}
-		setStatus(ctx, "wiki: snapshot");
+		updatePhase(ctx, "snapshot");
 		try {
 			snapshotWiki(paths.root); // pre-cycle snapshot for /wiki:undo
 
@@ -225,7 +314,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Phase B — translate
-			setStatus(ctx, "wiki: translating");
+			updatePhase(ctx, "extracting keyphrases");
 			const resolved = resolveTranslationModel(ctx, state.settings);
 			if (!resolved.model) {
 				return { ok: false, summary: "", opsApplied: 0, error: resolved.error };
@@ -259,6 +348,7 @@ export default function (pi: ExtensionAPI) {
 				relatedPages = blocks.join("\n\n---\n\n");
 			} catch {}
 
+			updatePhase(ctx, "calling translation model");
 			const userText = [
 				`# wiki/schema.md\n\n${schema}`,
 				`# wiki/index.md\n\n${index}`,
@@ -293,13 +383,13 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Phase C — apply
-			setStatus(ctx, `wiki: applying ${ops.length} ops`);
+			updatePhase(ctx, `applying ${ops.length} ops`);
 			const report = applyOps(paths, ops);
 
 			// Phase D — lint + reindex
 			let lintText = "";
 			if (state.settings.lint) {
-				setStatus(ctx, "wiki: linting");
+				updatePhase(ctx, "linting");
 				const lint = lintWiki(paths);
 				lintText = formatLintReport(lint, paths.root);
 				applyOps(paths, [{ op: "overwrite", path: "lint-report.md", content: lintText }]);
@@ -308,7 +398,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			setStatus(ctx, "wiki: reindexing");
+			updatePhase(ctx, "qmd reindex");
 			try {
 				await qmdEmbed(state.settings.qmdCollection, process.cwd());
 			} catch (err) {
@@ -316,6 +406,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			state.lastCycleAt = Date.now();
+			// Re-stamp every page's frontmatter source-sha after applying ops.
+			restampAllSourceTrackedPages(paths);
+			writeLastSync(paths, process.cwd());
 			notify(
 				ctx,
 				`Wiki updated: ${report.created.length} created, ${report.updated.length} updated, ${report.skipped.length} skipped.`,
@@ -330,7 +423,7 @@ export default function (pi: ExtensionAPI) {
 		} finally {
 			lock.release();
 			state.cycleInProgress = false;
-			setStatus(ctx, undefined);
+			stopIndicator(ctx);
 		}
 	};
 
@@ -345,6 +438,171 @@ export default function (pi: ExtensionAPI) {
 		const parsed = extractJson(result.text);
 		if (Array.isArray(parsed)) return (parsed as unknown[]).filter((s): s is string => typeof s === "string" && s.length > 0).slice(0, 5);
 		return [];
+	};
+
+	// ─── sync (filesystem-driven ingest) ──────────────────────────────
+
+	const runWikiSync = async (
+		ctx: ExtensionContext,
+		explicitTargets: string[] | undefined,
+	): Promise<{ ok: boolean; summary: string; targets: number; opsApplied: number; error?: string }> => {
+		if (state.cycleInProgress) return { ok: false, summary: "", targets: 0, opsApplied: 0, error: "cycle already running" };
+		state.cycleInProgress = true;
+		const sessionId = sessionIdOf(ctx);
+		startIndicator(ctx, "sync", "acquiring lock");
+		const { paths } = await scaffoldWiki(ctx);
+		if (!activeIndicator) startIndicator(ctx, "sync", "acquiring lock");
+		const lock = await acquireWikiLock(join(paths.root, ".lock"), sessionId, { timeoutMs: LOCK_TIMEOUT_MS });
+		if (!lock) {
+			state.cycleInProgress = false;
+			stopIndicator(ctx);
+			return { ok: false, summary: "", targets: 0, opsApplied: 0, error: `another session holds the wiki lock; try again shortly` };
+		}
+		try {
+			updatePhase(ctx, "detecting drift");
+			const drift = detectDrift(paths, process.cwd());
+			let targets = explicitTargets && explicitTargets.length > 0
+				? [...new Set(explicitTargets)].sort()
+				: suggestSyncTargets(drift, process.cwd());
+			// Cap to avoid runaway syncs on huge merges.
+			const MAX_TARGETS = 30;
+			let capped = false;
+			if (targets.length > MAX_TARGETS) {
+				targets = targets.slice(0, MAX_TARGETS);
+				capped = true;
+			}
+			if (targets.length === 0) {
+				writeLastSync(paths, process.cwd(), 0);
+				return { ok: true, summary: "no drift detected — wiki is up to date", targets: 0, opsApplied: 0 };
+			}
+
+			updatePhase(ctx, `reading ${targets.length} file(s)`);
+			const fileBlocks: string[] = [];
+			for (const rel of targets) {
+				const abs = resolvePath(process.cwd(), rel);
+				if (!existsSync(abs)) {
+					fileBlocks.push(`### ${rel}\n\n> [!removed] file no longer exists on disk`);
+					continue;
+				}
+				try {
+					const st = statSync(abs);
+					if (st.size > 200_000) {
+						fileBlocks.push(`### ${rel}\n\n_(file too large to inline — ${st.size} bytes)_`);
+						continue;
+					}
+					const content = readFileSync(abs, "utf8");
+					const trimmed = content.length > 8000 ? content.slice(0, 8000) + `\n\n…(truncated, ${content.length} bytes total)` : content;
+					fileBlocks.push(`### ${rel}\n\n\`\`\`\n${trimmed}\n\`\`\``);
+				} catch (err) {
+					fileBlocks.push(`### ${rel}\n\n_(read error: ${String(err).slice(0, 200)})_`);
+				}
+			}
+
+			updatePhase(ctx, "fetching related pages");
+			const resolved = resolveTranslationModel(ctx, state.settings);
+			if (!resolved.model) return { ok: false, summary: "", targets: targets.length, opsApplied: 0, error: resolved.error };
+
+			// Pre-fetch related wiki pages keyed off the file paths themselves.
+			const hitMap = new Map<string, string>();
+			for (const rel of targets.slice(0, 10)) {
+				const hits = await qmdQuery(rel, state.settings.qmdCollection, 3);
+				for (const h of hits) {
+					const p = (h.path as string) || "";
+					if (!p || hitMap.has(p)) continue;
+					const abs = p.startsWith("/") ? p : join(paths.root, p);
+					const content = readFileIfExists(abs);
+					if (content) hitMap.set(p, `### ${relative(paths.root, abs)}\n\n${content.slice(0, 4000)}`);
+				}
+			}
+			const relatedPages = [...hitMap.values()].slice(0, 8).join("\n\n---\n\n");
+
+			const schema = readFileIfExists(paths.schemaMd) ?? "";
+			const userText = [
+				`# wiki/schema.md\n\n${schema}`,
+				relatedPages ? `# Pre-existing related wiki pages\n\n${relatedPages}` : "",
+				`# Changed source files (current content)\n\n${fileBlocks.join("\n\n---\n\n")}`,
+			].filter(Boolean).join("\n\n---\n\n");
+
+			updatePhase(ctx, "calling translation model");
+			const llm = await callModelText(ctx, resolved.model, PROMPT_SYNC, userText, ctx.signal, 8192);
+			if (!llm.ok) return { ok: false, summary: "", targets: targets.length, opsApplied: 0, error: `sync translate failed: ${llm.error}` };
+
+			const parsed = extractJson(llm.text) as { summary?: string; ops?: WikiOp[] } | undefined;
+			if (!parsed) return { ok: false, summary: "", targets: targets.length, opsApplied: 0, error: "sync produced unparseable JSON" };
+			const ops: WikiOp[] = Array.isArray(parsed.ops) ? parsed.ops : [];
+
+			// Inject session id + sync kind into log entries.
+			const hasLog = ops.some((o) => o.op === "log");
+			if (!hasLog) {
+				ops.push({
+					op: "log",
+					entry: `## [${nowStamp()}] sync | ${sessionId} | ${(parsed.summary ?? `synced ${targets.length} file(s)`).replace(/\n/g, " ").slice(0, 200)}${capped ? " (capped)" : ""}`,
+				});
+			} else {
+				for (const op of ops) {
+					if (op.op === "log" && !op.entry.includes(sessionId)) {
+						op.entry = op.entry.replace(/^(##\s+\[[^\]]+\]\s+\S+\s+\|\s+)/, `$1${sessionId} | `);
+					}
+				}
+			}
+
+			updatePhase(ctx, `applying ${ops.length} ops`);
+			snapshotWiki(paths.root);
+			const report = applyOps(paths, ops);
+
+			if (state.settings.lint) {
+				updatePhase(ctx, "linting");
+				const lint = lintWiki(paths);
+				applyOps(paths, [{ op: "overwrite", path: "lint-report.md", content: formatLintReport(lint, paths.root) }]);
+			}
+
+			updatePhase(ctx, "restamping + reindexing");
+			restampAllSourceTrackedPages(paths);
+			writeLastSync(paths, process.cwd(), targets.length);
+			try {
+				await qmdEmbed(state.settings.qmdCollection, process.cwd());
+			} catch {}
+
+			return {
+				ok: true,
+				summary: `${parsed.summary ?? "sync complete"} (created ${report.created.length}, updated ${report.updated.length}${capped ? ", capped" : ""})`,
+				targets: targets.length,
+				opsApplied: ops.length,
+			};
+		} finally {
+			lock.release();
+			state.cycleInProgress = false;
+			stopIndicator(ctx);
+		}
+	};
+
+	const restampAllSourceTrackedPages = (paths: ReturnType<typeof resolveWikiPaths>) => {
+		for (const wikiFile of listMarkdownFiles(paths.root)) {
+			let text: string;
+			try {
+				text = readFileSync(wikiFile, "utf8");
+			} catch {
+				continue;
+			}
+			const parsed = parseDoc(text);
+			const sourceFile = parsed.frontmatter["source-file"];
+			if (typeof sourceFile !== "string" || !sourceFile) continue;
+			const sourceAbs = resolvePath(process.cwd(), sourceFile);
+			const sha = gitBlobShaOfFile(sourceAbs);
+			if (!sha) {
+				parsed.frontmatter["source-sha"] = null;
+				parsed.frontmatter["source-status"] = "missing";
+			} else {
+				parsed.frontmatter["source-sha"] = sha;
+				delete parsed.frontmatter["source-status"];
+				const mtime = fileMtime(sourceAbs);
+				if (mtime !== undefined) parsed.frontmatter["source-mtime"] = mtime;
+			}
+			parsed.frontmatter["last-synced"] = new Date().toISOString().slice(0, 10);
+			try {
+				writeFileSync(wikiFile, serializeDoc(parsed.frontmatter, parsed.body));
+			} catch {}
+		}
 	};
 
 	// ─── seed prompt for new session ──────────────────────────────────
@@ -371,6 +629,18 @@ export default function (pi: ExtensionAPI) {
 			scaffoldWiki(ctx).catch((err) =>
 				notify(ctx, `wiki scaffold failed: ${err instanceof Error ? err.message : String(err)}`, "error"),
 			);
+		} else if (isWikiBootstrapped(paths)) {
+			// Drift notification (cheap; never auto-syncs).
+			try {
+				const drift = detectDrift(paths, process.cwd());
+				const total = drift.changedFiles.length + drift.staleWikiPages.length;
+				if (total >= 3) {
+					const bits: string[] = [];
+					if (drift.changedFiles.length) bits.push(`${drift.changedFiles.length} file(s) changed since last sync`);
+					if (drift.staleWikiPages.length) bits.push(`${drift.staleWikiPages.length} wiki page(s) drifted`);
+					notify(ctx, `Wiki may be stale: ${bits.join(", ")}. Run /wiki:sync (or /wiki:status for detail).`, "warning");
+				}
+			} catch {}
 		}
 	});
 
@@ -531,24 +801,40 @@ export default function (pi: ExtensionAPI) {
 				notify(ctx, "wiki: no snapshots to restore from.", "warning");
 				return;
 			}
+			startIndicator(ctx, "undo", "acquiring lock");
 			const lock = await acquireWikiLock(join(paths.root, ".lock"), sessionIdOf(ctx), { timeoutMs: LOCK_TIMEOUT_MS });
 			if (!lock) {
+				stopIndicator(ctx);
 				notify(ctx, "wiki: another session holds the lock; try again shortly.", "warning");
 				return;
 			}
 			try {
+				updatePhase(ctx, "restoring snapshot");
 				const restored = restoreLatestSnapshot(paths.root);
 				if (!restored) {
 					notify(ctx, "wiki: snapshot restore failed.", "error");
 					return;
 				}
+				updatePhase(ctx, "qmd reindex");
 				try {
 					await qmdEmbed(state.settings.qmdCollection, process.cwd());
 				} catch {}
 				notify(ctx, `wiki: restored snapshot ${restored.stamp}. ${snapshots.length - 1} snapshot(s) remain.`, "info");
 			} finally {
 				lock.release();
+				stopIndicator(ctx);
 			}
+		},
+	});
+
+	pi.registerCommand("wiki:sync", {
+		description: "Sync the wiki with on-disk changes (git diff since last sync, or explicit paths).",
+		handler: async (args, ctx) => {
+			refreshSettings();
+			const targets = args.trim().length ? args.trim().split(/\s+/) : undefined;
+			const result = await runWikiSync(ctx, targets);
+			if (result.ok) notify(ctx, `wiki sync: ${result.summary} [${result.targets} target(s), ${result.opsApplied} ops]`, "info");
+			else notify(ctx, `wiki sync failed: ${result.error}`, "error");
 		},
 	});
 
@@ -561,12 +847,22 @@ export default function (pi: ExtensionAPI) {
 			const qmdSt = qmdHas ? await qmdStatus(state.settings.qmdCollection) : null;
 			const snapshots = listSnapshots(paths.root);
 			const lockMeta = readFileIfExists(join(paths.root, ".lock"));
+			const gitOn = isGitRepo(process.cwd());
+			let driftLine = "drift:           (skipped)";
+			if (isWikiBootstrapped(paths)) {
+				try {
+					const d = detectDrift(paths, process.cwd());
+					driftLine = `drift:           ${d.changedFiles.length} file(s) changed${d.staleWikiPages.length ? `, ${d.staleWikiPages.length} wiki page(s) drifted` : ""} (mode: ${d.mode})`;
+				} catch {}
+			}
 			const lines = [
 				`wiki dir:        ${relative(process.cwd(), paths.root) || paths.root}`,
 				`bootstrapped:    ${isWikiBootstrapped(paths) ? "yes" : "no"}`,
 				`session id:      ${sessionIdOf(ctx)}`,
 				`lock:            ${lockMeta ? lockMeta.replace(/\s+/g, " ").slice(0, 120) : "free"}`,
 				`snapshots:       ${snapshots.length} (latest: ${snapshots[0]?.stamp ?? "none"})`,
+				`git repo:        ${gitOn ? "yes" : "no (using mtime fallback)"}`,
+				driftLine,
 				`context fill:    ${ratio === null ? "unknown" : (ratio * 100).toFixed(1) + "%"} (trigger ${(state.settings.triggerFillRatio * 100).toFixed(0)}%)`,
 				`armed:           ${state.armed ? "yes" : "no (will re-arm under " + Math.round(state.settings.triggerFillRatio * 80) + "%)"}`,
 				`qmd installed:   ${qmdHas ? "yes" : "no — install with: npm i -g @tobilu/qmd"}`,
@@ -666,6 +962,17 @@ last-updated: 2026-04-30
 ---
 \`\`\`
 
+For pages tracking a specific project source file, include:
+
+\`\`\`yaml
+---
+source-file: src/path/to/file.ts   # project-relative; REQUIRED for drift tracking
+source-sha: <git blob sha>          # auto-stamped by the keeper
+source-mtime: <unix ms>             # auto-stamped by the keeper
+last-synced: 2026-04-30             # auto-stamped by the keeper
+---
+\`\`\`
+
 Then markdown. Use \`[[PageName]]\` for cross-references, and standard \`[text](relative.md)\` for links to sources.
 
 ## Contradictions
@@ -679,11 +986,24 @@ When new information conflicts with existing claims, flag it inline:
 
 When a claim is fully superseded, ~~strike through~~ the old text and append \`see [[NewPage]]\`.
 
+## File-change callouts
+
+When a sync detects on-disk changes, the keeper uses these callouts:
+
+> [!updated]
+> Behavior changed at <date>: <what>
+
+> [!renamed]
+> From: old/path.ts → new/path.ts
+
+> [!removed]
+> File removed at <date>. Last known content: see snapshot or git history.
+
 ## Log entry format
 
-\`## [YYYY-MM-DD HH:MM] <kind> | <session-or-task-id> | <one-line summary>\`
+\`## [YYYY-MM-DD HH:MM] <kind> | <session-id> | <one-line summary>\`
 
-Kinds: \`ingest\`, \`scaffold\`, \`lint\`, \`manual-flush\`, \`manual-rotate\`, \`auto\`.
+Kinds: \`ingest\`, \`scaffold\`, \`lint\`, \`manual-flush\`, \`manual-rotate\`, \`auto\`, \`sync\`.
 `;
 }
 
