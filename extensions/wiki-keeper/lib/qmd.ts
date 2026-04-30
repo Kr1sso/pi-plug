@@ -74,6 +74,20 @@ export async function qmdEnsureCollection(collection: string, wikiRoot: string):
 	return r;
 }
 
+/**
+ * Re-index a qmd collection: runs `qmd update` (lex/BM25 index) followed by `qmd embed`
+ * (vector embeddings). qmd's `embed` only processes hashes already known to the lex index,
+ * so calling `embed` without first calling `update` is a no-op for new/changed files — a
+ * silent failure mode that produces empty wiki_query results even when the wiki has
+ * dozens of pages on disk.
+ */
+export async function qmdReindex(collection: string, cwd: string): Promise<{ update: QmdResult; embed: QmdResult; ok: boolean }> {
+	const update = await run("qmd", ["update"], { cwd, timeoutMs: 5 * 60_000 });
+	// Even if `update` fails (e.g. transient lock), still try embed for any pending hashes.
+	const embed = await run("qmd", ["embed", "-c", collection], { cwd, timeoutMs: 10 * 60_000 });
+	return { update, embed, ok: update.ok && embed.ok };
+}
+
 export async function qmdEmbed(collection: string, cwd: string): Promise<QmdResult> {
 	return run("qmd", ["embed", "-c", collection], { cwd, timeoutMs: 5 * 60_000 });
 }

@@ -22,7 +22,7 @@ import {
 	readFileIfExists,
 	type WikiOp,
 } from "./lib/wiki-fs.js";
-import { qmdAvailable, qmdCollectionIsEmpty, qmdEmbed, qmdEnsureCollection, qmdQuery, qmdStatus } from "./lib/qmd.js";
+import { qmdAvailable, qmdCollectionIsEmpty, qmdEnsureCollection, qmdReindex, qmdQuery, qmdStatus } from "./lib/qmd.js";
 import { callModelText, callModelTextJson, extractJson, resolveTranslationModel } from "./lib/translate.js";
 
 // Shared JSON-shape reminder used when retrying a flush after the first response is unparseable.
@@ -357,7 +357,7 @@ export default function (pi: ExtensionAPI) {
 
 			updatePhase(ctx, "qmd reindex");
 			try {
-				await qmdEmbed(getCollection(), process.cwd());
+				await qmdReindex(getCollection(), process.cwd());
 			} catch {}
 			notify(ctx, `Wiki scaffolded at ${relative(process.cwd(), paths.root) || paths.root}.`, "info");
 			return { paths, scaffolded: true };
@@ -517,7 +517,7 @@ export default function (pi: ExtensionAPI) {
 
 			updatePhase(ctx, "qmd reindex");
 			try {
-				await qmdEmbed(getCollection(), process.cwd());
+				await qmdReindex(getCollection(), process.cwd());
 			} catch (err) {
 				notify(ctx, `qmd embed failed: ${err instanceof Error ? err.message : String(err)}`, "warning");
 			}
@@ -700,7 +700,7 @@ export default function (pi: ExtensionAPI) {
 			restampAllSourceTrackedPages(paths);
 			writeLastSync(paths, process.cwd(), targets.length);
 			try {
-				await qmdEmbed(getCollection(), process.cwd());
+				await qmdReindex(getCollection(), process.cwd());
 			} catch {}
 
 			return {
@@ -834,7 +834,7 @@ export default function (pi: ExtensionAPI) {
 			restampAllSourceTrackedPages(paths);
 			writeLastSync(paths, process.cwd());
 			try {
-				await qmdEmbed(getCollection(), process.cwd());
+				await qmdReindex(getCollection(), process.cwd());
 			} catch {}
 
 			return {
@@ -933,7 +933,7 @@ export default function (pi: ExtensionAPI) {
 						const empty = await qmdCollectionIsEmpty(getCollection());
 						if (empty && listMarkdownFiles(paths.root).length > 0) {
 							notify(ctx, "wiki: qmd index empty for this collection — embedding now (one-time cost).", "info");
-							await qmdEmbed(getCollection(), process.cwd());
+							await qmdReindex(getCollection(), process.cwd());
 						}
 					} catch {}
 				})();
@@ -1198,7 +1198,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				updatePhase(ctx, "qmd reindex");
 				try {
-					await qmdEmbed(getCollection(), process.cwd());
+					await qmdReindex(getCollection(), process.cwd());
 				} catch {}
 				notify(ctx, `wiki: restored snapshot ${restored.stamp}. ${snapshots.length - 1} snapshot(s) remain.`, "info");
 			} finally {
@@ -1248,7 +1248,7 @@ export default function (pi: ExtensionAPI) {
 					},
 				]);
 				try {
-					await qmdEmbed(getCollection(), process.cwd());
+					await qmdReindex(getCollection(), process.cwd());
 				} catch {}
 				notify(
 					ctx,
