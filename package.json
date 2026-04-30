@@ -11,7 +11,8 @@
   },
   "scripts": {
     "postinstall": "bash ./install.sh || true",
-    "check": "echo 'no checks configured'"
+    "test": "node --experimental-strip-types --test extensions/wiki-keeper/lib/*.test.ts",
+    "check": "npm test"
   },
   "pi": {
     "extensions": [
