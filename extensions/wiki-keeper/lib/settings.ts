@@ -33,6 +33,8 @@ export interface WikiKeeperSettings {
 	logArchiveSuggestEntries: number;
 	/** Hard cap on the user-message size (in characters) sent to the translation model. Truncates the transcript tail-first to fit. ~3 chars/token, so 600k chars ≈ 200k tokens — safely under most providers' 1M-token cap with room for system prompt + response. */
 	maxPromptChars: number;
+	/** Hard cap on translation-model OUTPUT tokens (per call). Wiki ops can be large (full-file content blocks); 8k truncates them. Modern Claude/GPT-class models support 32–64k output tokens. */
+	maxOutputTokens: number;
 }
 
 export const DEFAULT_SETTINGS: WikiKeeperSettings = {
@@ -51,6 +53,7 @@ export const DEFAULT_SETTINGS: WikiKeeperSettings = {
 	prefetchMinPages: 5,
 	logArchiveSuggestEntries: 500,
 	maxPromptChars: 600_000,
+	maxOutputTokens: 32_000,
 };
 
 interface SettingsFile {
