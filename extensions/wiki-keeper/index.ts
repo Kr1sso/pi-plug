@@ -1107,8 +1107,28 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			refreshSettings();
 			const result = await runWikiCycle({ ctx, reason: "manual-flush" });
-			if (result.ok) notify(ctx, `wiki flushed: ${result.summary}`, "info");
-			else notify(ctx, `wiki flush failed: ${result.error}`, "error");
+			if (!result.ok) {
+				notify(ctx, `wiki flush failed: ${result.error}`, "error");
+				return;
+			}
+			notify(ctx, `wiki flushed: ${result.summary}`, "info");
+
+			// Re-arm the auto-rotate hysteresis: a successful manual flush means future turn_end
+			// auto-rotation should be allowed to fire again, even if armed was previously dropped.
+			state.armed = true;
+
+			// If we're still over the auto-rotate threshold, follow the flush with an in-place compaction.
+			// Wiki is fresh, so pi's default summariser is sufficient (no need to re-run the wiki cycle
+			// via WIKI_KEEPER_ROTATE customInstructions). Honors user intent: "update wiki and free context".
+			if (state.settings.autoCompactOnTrigger) {
+				const ratio = computeFillRatio(ctx);
+				if (ratio !== null && ratio >= state.settings.triggerFillRatio) {
+					notify(ctx, `Context still at ${(ratio * 100).toFixed(0)}% — compacting in place.`, "info");
+					ctx.compact({
+						onError: (err) => notify(ctx, `post-flush compaction failed: ${err.message}`, "error"),
+					});
+				}
+			}
 		},
 	});
 
