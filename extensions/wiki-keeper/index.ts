@@ -1030,8 +1030,21 @@ export default function (pi: ExtensionAPI) {
 		const result = await runWikiCycle({ ctx, preparedTranscript: transcript, reason: "auto" });
 		if (!result.ok) {
 			state.armed = true;
-			notify(ctx, `Wiki rotation skipped: ${result.error ?? "unknown error"}. Context preserved; will retry.`, "warning");
-			return { cancel: true };
+			// User explicitly cancelled (Esc during compaction) — honor their intent: cancel compaction.
+			if (event.signal?.aborted) {
+				notify(ctx, `Wiki rotation cancelled by user. Context preserved.`, "info");
+				return { cancel: true };
+			}
+			// Wiki cycle failed for some other reason (translation error, network blip, model error).
+			// Don't strand the user at high fill: fall back to pi's DEFAULT compaction by returning
+			// undefined (no override). The wiki update is lost for this cycle, but context still
+			// gets freed; armed=true ensures we'll retry the wiki cycle next turn_end.
+			notify(
+				ctx,
+				`Wiki rotation failed: ${result.error ?? "unknown error"}. Falling back to pi default compaction; will retry wiki update next turn.`,
+				"warning",
+			);
+			return; // undefined → pi runs its default summariser, compaction proceeds
 		}
 		const seed = buildSeed(ctx, "");
 		const rawSummary = result.summary;

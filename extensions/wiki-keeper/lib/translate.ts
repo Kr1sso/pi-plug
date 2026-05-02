@@ -117,9 +117,16 @@ export async function callModelTextJson(
 			lastStopReason = (response as { stopReason?: string }).stopReason;
 			const apiErrorMessage = (response as { errorMessage?: string }).errorMessage;
 
-			// Hard API failure (rate limit, 5xx, context-too-large, auth, etc.) — retry won't help
-			// and may make things worse. Surface the underlying errorMessage and bail immediately.
+			// Hard API failure (rate limit, 5xx, context-too-large, auth, etc.) — most are not
+			// retryable. But "transient" network errors (undici 'terminated', socket resets,
+			// fetch failures) are usually safe to retry once with backoff.
 			if (lastStopReason === "error" || lastStopReason === "aborted") {
+				const transient = apiErrorMessage && /\b(terminated|fetch failed|ECONNRESET|socket hang up|network error|EAI_AGAIN|ETIMEDOUT)\b/i.test(apiErrorMessage);
+				if (transient && attempt <= maxRetries && !signal?.aborted) {
+					// Backoff briefly and retry the SAME prompt (don't add a corrective turn).
+					await new Promise((r) => setTimeout(r, 1500));
+					continue;
+				}
 				return {
 					ok: false,
 					text: lastText,
