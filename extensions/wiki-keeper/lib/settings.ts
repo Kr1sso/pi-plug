@@ -3,8 +3,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
 export interface WikiKeeperSettings {
-	/** Trigger ratio in [0..1] of context fill that fires the wiki cycle. */
+	/** Trigger ratio in [0..1] of context fill that fires the wiki cycle at a natural turn break (no outstanding tool calls). Soft trigger — honors the agent's task. */
 	triggerFillRatio: number;
+	/** Critical trigger ratio in [0..1] of context fill that fires the wiki cycle EVEN MID-TOOL-CHAIN. Above this, pi's own auto-compact will fire and abort the chain anyway, so we may as well do it ourselves and capture a wiki update. Default 0.85. Set to 1.0 to disable. */
+	criticalFillRatio: number;
 	/** Project-relative wiki dir. */
 	wikiDir: string;
 	/** Subdir for raw, immutable sources. */
@@ -39,6 +41,7 @@ export interface WikiKeeperSettings {
 
 export const DEFAULT_SETTINGS: WikiKeeperSettings = {
 	triggerFillRatio: 0.5,
+	criticalFillRatio: 0.85,
 	wikiDir: "wiki",
 	rawSubdir: "raw",
 	qmdCollection: "",

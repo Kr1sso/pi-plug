@@ -977,20 +977,24 @@ export default function (pi: ExtensionAPI) {
 		refreshSettings(); // hot-reload settings each turn check
 		if (state.cycleInProgress) return;
 
-		// CRITICAL: turn_end fires after EVERY tool roundtrip, not just when the agent is
-		// truly done (per pi-agent-core/agent-loop.js — `await emit({ type: "turn_end" })`
-		// runs inside `while (hasMoreToolCalls)`). Calling ctx.compact() mid-loop aborts the
-		// in-flight agent (compact() does _disconnectFromAgent + await abort()), leaving the
-		// user's task half-finished. Only trigger when this turn's assistant message has NO
-		// outstanding tool calls — i.e., the agent is about to exit the loop naturally.
-		const hasOutstandingToolCalls = Array.isArray(event.message?.content)
-			&& event.message.content.some((c: { type?: string }) => c?.type === "toolCall");
-		if (hasOutstandingToolCalls) return;
-
 		const ratio = computeFillRatio(ctx);
 		if (ratio === null) return;
 		// Hysteresis: re-arm when we drop back under threshold.
 		if (ratio < state.settings.triggerFillRatio * 0.8) state.armed = true;
+
+		// CRITICAL: turn_end fires after EVERY tool roundtrip, not just when the agent is
+		// truly done (per pi-agent-core/agent-loop.js — `await emit({ type: "turn_end" })`
+		// runs inside `while (hasMoreToolCalls)`). Calling ctx.compact() mid-loop aborts the
+		// in-flight agent. Normally we wait for a natural turn break (no outstanding tool
+		// calls) before triggering. EXCEPT when fill is critically high — pi's own
+		// auto-compact will fire and abort the chain anyway, so we may as well do it
+		// ourselves and capture a wiki update along the way (and also handle pi's auto-
+		// compact via the session_before_compact handler below as a final safety net).
+		const hasOutstandingToolCalls = Array.isArray(event.message?.content)
+			&& event.message.content.some((c: { type?: string }) => c?.type === "toolCall");
+		const critical = ratio >= state.settings.criticalFillRatio;
+		if (hasOutstandingToolCalls && !critical) return;
+
 		if (!state.armed) return;
 		if (ratio < state.settings.triggerFillRatio) return;
 		if (Date.now() - state.lastCycleAt < state.settings.cooldownMs) return;
@@ -1005,7 +1009,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		notify(
 			ctx,
-			`Context at ${(ratio * 100).toFixed(0)}% — triggering wiki rotation (threshold ${(state.settings.triggerFillRatio * 100).toFixed(0)}%).`,
+			`Context at ${(ratio * 100).toFixed(0)}% — triggering wiki rotation (soft ${(state.settings.triggerFillRatio * 100).toFixed(0)}%, critical ${(state.settings.criticalFillRatio * 100).toFixed(0)}%${critical ? ", CRITICAL OVERRIDE: aborting tool chain to compact before pi auto-compact does" : ""}).`,
 			"info",
 		);
 		// Use ctx.compact to swap context after the wiki update completes via session_before_compact.
@@ -1022,8 +1026,13 @@ export default function (pi: ExtensionAPI) {
 	// Manual /compact (or any other extension's compaction) flows through unmodified.
 	// On failure, return { cancel: true } so the user's context is NOT swapped — they keep their
 	// conversation and the next turn_end can re-attempt (we re-arm armed=true here too).
+	// Handles BOTH our explicit auto-rotate (customInstructions === "WIKI_KEEPER_ROTATE")
+	// AND pi's own auto-compaction at threshold (customInstructions === undefined) AND
+	// the user's manual /compact command (also undefined). For all of these, we want to
+	// run the wiki cycle and provide a wiki-aware compaction summary. This is the safety
+	// net for cases where our turn_end heuristic delays firing (e.g. long agent tool chains
+	// where every turn_end has outstanding tool calls below the critical threshold).
 	pi.on("session_before_compact", async (event, ctx) => {
-		if (event.customInstructions !== "WIKI_KEEPER_ROTATE") return;
 		const { preparation } = event;
 		const all = [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
 		const transcript = serializeConversation(convertToLlm(all));
@@ -1326,7 +1335,7 @@ export default function (pi: ExtensionAPI) {
 				`log entries:     ${logEntries}${logEntries > state.settings.logArchiveSuggestEntries ? " — consider /wiki:archive" : ""}`,
 				`git repo:        ${gitOn ? "yes" : "no (using mtime fallback)"}`,
 				driftLine,
-				`context fill:    ${ratio === null ? "unknown" : (ratio * 100).toFixed(1) + "%"} (trigger ${(state.settings.triggerFillRatio * 100).toFixed(0)}%)`,
+					`context fill:    ${ratio === null ? "unknown" : (ratio * 100).toFixed(1) + "%"} (soft ${(state.settings.triggerFillRatio * 100).toFixed(0)}%, critical ${(state.settings.criticalFillRatio * 100).toFixed(0)}%)`,
 				`armed:           ${state.armed ? "yes" : "no (will re-arm under " + Math.round(state.settings.triggerFillRatio * 80) + "%)"}`,
 				`auto-rotate:     ${state.settings.autoCompactOnTrigger ? "on" : "off (manual /wiki:rotate only)"}`,
 				`qmd installed:   ${qmdHas ? "yes" : "no — install with: npm i -g @tobilu/qmd"}`,
