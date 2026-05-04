@@ -85,38 +85,100 @@ export async function callModelTextJson(
 	userText: string,
 	signal: AbortSignal | undefined,
 	maxTokens = 8192,
-	opts: { jsonShapeReminder?: string; retries?: number; debugDumpPath?: string } = {},
+	opts: {
+		jsonShapeReminder?: string;
+		retries?: number;
+		debugDumpPath?: string;
+		/** Called every ~500ms with current streamed character count. Use to update UI phase widget. */
+		onProgress?: (chars: number, elapsedMs: number) => void;
+		/** Hard cap on a single attempt; abort if exceeded. Default 6 minutes (large 32k-token outputs at slow tokens/sec). */
+		perAttemptTimeoutMs?: number;
+		/** Idle timeout: abort if no chars received for this long. Default 90s (provider stalled). */
+		idleTimeoutMs?: number;
+	} = {},
 ): Promise<{ ok: true; text: string; parsed: unknown; attempts: number } | { ok: false; text: string; error: string; attempts: number; stopReason?: string }> {
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 	if (!auth.ok) return { ok: false, text: "", error: `auth failed: ${auth.error}`, attempts: 0 };
 	if (!auth.apiKey) return { ok: false, text: "", error: `no API key for ${model.provider}`, attempts: 0 };
 
 	const maxRetries = Math.max(0, opts.retries ?? 1);
+	const perAttemptTimeoutMs = opts.perAttemptTimeoutMs ?? 6 * 60_000;
+	const idleTimeoutMs = opts.idleTimeoutMs ?? 90_000;
 	const messages: Message[] = [
 		{ role: "user", content: [{ type: "text", text: userText }], timestamp: Date.now() },
 	];
 
 	// Lazy-load runtime dep — see callModelText for rationale (test-env loadability).
-	const { complete } = await import("@mariozechner/pi-ai");
+	const { stream } = await import("@mariozechner/pi-ai");
 
 	let lastText = "";
 	let lastError = "";
 	let lastStopReason: string | undefined;
 	for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+		// Compose attempt-scoped abort: caller signal | per-attempt timeout | idle watchdog.
+		const attemptCtl = new AbortController();
+		const onCallerAbort = () => attemptCtl.abort(new Error("caller aborted"));
+		signal?.addEventListener("abort", onCallerAbort, { once: true });
+		const hardTimeout = setTimeout(() => attemptCtl.abort(new Error(`per-attempt timeout (${Math.round(perAttemptTimeoutMs / 1000)}s)`)), perAttemptTimeoutMs);
+		let idleTimer: NodeJS.Timeout | undefined;
+		const armIdleTimer = () => {
+			if (idleTimer) clearTimeout(idleTimer);
+			idleTimer = setTimeout(() => attemptCtl.abort(new Error(`idle timeout (no chars for ${Math.round(idleTimeoutMs / 1000)}s)`)), idleTimeoutMs);
+		};
+		armIdleTimer();
+		const startedAt = Date.now();
+		let text = "";
+		let response: any = undefined;
+		let streamError: Error | undefined;
 		try {
-			const response = await complete(
+			const evStream = stream(
 				model,
 				{ systemPrompt, messages },
-				{ apiKey: auth.apiKey, headers: auth.headers, maxTokens, signal },
+				{ apiKey: auth.apiKey, headers: auth.headers, maxTokens, signal: attemptCtl.signal },
 			);
-			const text = response.content
-				.filter((c): c is { type: "text"; text: string } => c.type === "text")
-				.map((c) => c.text)
-				.join("\n");
-			lastText = text;
-			lastStopReason = (response as { stopReason?: string }).stopReason;
-			const apiErrorMessage = (response as { errorMessage?: string }).errorMessage;
+			let lastProgressTick = 0;
+			for await (const ev of evStream) {
+				if ((ev as any).type === "text_delta") {
+					const delta = (ev as any).delta as string;
+					text += delta;
+					armIdleTimer();
+					if (opts.onProgress && Date.now() - lastProgressTick >= 500) {
+						lastProgressTick = Date.now();
+						try { opts.onProgress(text.length, Date.now() - startedAt); } catch {}
+					}
+				}
+			}
+			response = await evStream.result();
+		} catch (err) {
+			streamError = err instanceof Error ? err : new Error(String(err));
+		} finally {
+			clearTimeout(hardTimeout);
+			if (idleTimer) clearTimeout(idleTimer);
+			signal?.removeEventListener("abort", onCallerAbort);
+		}
 
+		try {
+			// If stream() yielded a result message, prefer its joined text content (handles models that emit text_block sentinel events).
+			if (response && Array.isArray(response.content)) {
+				const joined = response.content
+					.filter((c: any): c is { type: "text"; text: string } => c.type === "text")
+					.map((c: any) => c.text)
+					.join("\n");
+				if (joined.length > text.length) text = joined;
+			}
+			lastText = text;
+			lastStopReason = response?.stopReason;
+			const apiErrorMessage = (response?.errorMessage as string | undefined) ?? streamError?.message;
+
+			// Stream errored out (timeout, network drop, abort). Treat as transient if matches.
+			if (streamError && lastStopReason !== "length") {
+				const transient = /\b(terminated|fetch failed|ECONNRESET|socket hang up|network error|EAI_AGAIN|ETIMEDOUT|idle timeout|per-attempt timeout)\b/i.test(streamError.message);
+				if (transient && attempt <= maxRetries && !signal?.aborted) {
+					await new Promise((r) => setTimeout(r, 1500));
+					continue;
+				}
+				return { ok: false, text: lastText, error: `model stream error: ${streamError.message}`, attempts: attempt, stopReason: lastStopReason };
+			}
 			// Hard API failure (rate limit, 5xx, context-too-large, auth, etc.) — most are not
 			// retryable. But "transient" network errors (undici 'terminated', socket resets,
 			// fetch failures) are usually safe to retry once with backoff.

@@ -468,7 +468,11 @@ export default function (pi: ExtensionAPI) {
 			}
 			const userText = built.text;
 
-			const llm = await callModelTextJson(ctx, resolved.model, PROMPT_INGEST, userText, ctx.signal, state.settings.maxOutputTokens, { jsonShapeReminder: OPS_JSON_SHAPE_REMINDER, debugDumpPath: join(paths.root, ".debug", "last-bad-flush.txt") });
+			const llm = await callModelTextJson(ctx, resolved.model, PROMPT_INGEST, userText, ctx.signal, state.settings.maxOutputTokens, {
+				jsonShapeReminder: OPS_JSON_SHAPE_REMINDER,
+				debugDumpPath: join(paths.root, ".debug", "last-bad-flush.txt"),
+				onProgress: (chars, elapsedMs) => updatePhase(ctx, `streaming flush response (${(chars / 1000).toFixed(1)}k chars, ${Math.round(elapsedMs / 1000)}s)`),
+			});
 			if (!llm.ok) {
 				const suffix = llm.attempts > 1 ? ` (after ${llm.attempts} attempt(s))` : "";
 				return { ok: false, summary: "", opsApplied: 0, error: `translate failed${suffix}: ${llm.error}` };
@@ -661,7 +665,11 @@ export default function (pi: ExtensionAPI) {
 			const userText = built.text;
 
 			updatePhase(ctx, "calling translation model");
-			const llm = await callModelTextJson(ctx, resolved.model, PROMPT_SYNC, userText, ctx.signal, state.settings.maxOutputTokens, { jsonShapeReminder: OPS_JSON_SHAPE_REMINDER, debugDumpPath: join(paths.root, ".debug", "last-bad-sync.txt") });
+			const llm = await callModelTextJson(ctx, resolved.model, PROMPT_SYNC, userText, ctx.signal, state.settings.maxOutputTokens, {
+				jsonShapeReminder: OPS_JSON_SHAPE_REMINDER,
+				debugDumpPath: join(paths.root, ".debug", "last-bad-sync.txt"),
+				onProgress: (chars, elapsedMs) => updatePhase(ctx, `streaming sync response (${(chars / 1000).toFixed(1)}k chars, ${Math.round(elapsedMs / 1000)}s)`),
+			});
 			if (!llm.ok) {
 				const suffix = llm.attempts > 1 ? ` (after ${llm.attempts} attempt(s))` : "";
 				return { ok: false, summary: "", targets: targets.length, opsApplied: 0, error: `sync translate failed${suffix}: ${llm.error}` };
@@ -795,7 +803,11 @@ export default function (pi: ExtensionAPI) {
 			if (!resolved.model) {
 				return { ok: false, summary: "", opsApplied: 0, remainingDead: lintBefore.deadLinks.length, remainingOrphans: lintBefore.orphans.length, error: resolved.error };
 			}
-			const llm = await callModelTextJson(ctx, resolved.model, PROMPT_FIX, userText, ctx.signal, state.settings.maxOutputTokens, { jsonShapeReminder: OPS_JSON_SHAPE_REMINDER, debugDumpPath: join(paths.root, ".debug", "last-bad-fix.txt") });
+			const llm = await callModelTextJson(ctx, resolved.model, PROMPT_FIX, userText, ctx.signal, state.settings.maxOutputTokens, {
+				jsonShapeReminder: OPS_JSON_SHAPE_REMINDER,
+				debugDumpPath: join(paths.root, ".debug", "last-bad-fix.txt"),
+				onProgress: (chars, elapsedMs) => updatePhase(ctx, `streaming fix response (${(chars / 1000).toFixed(1)}k chars, ${Math.round(elapsedMs / 1000)}s)`),
+			});
 			if (!llm.ok) {
 				const suffix = llm.attempts > 1 ? ` (after ${llm.attempts} attempt(s))` : "";
 				return { ok: false, summary: "", opsApplied: 0, remainingDead: lintBefore.deadLinks.length, remainingOrphans: lintBefore.orphans.length, error: `repair translate failed${suffix}: ${llm.error}` };
